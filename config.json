@@ -1,0 +1,21 @@
+{
+    "sheet_name": "job-scrapper",
+    "urls_file": "company_urls.txt",
+    "ollama_model": "llama3",
+    "max_retries": 3,
+    "delay_between_requests": 3,
+    "timeout": 30,
+    "use_selenium_for_js": true,
+    "headless_browser": true,
+    "log_level": "INFO",
+    "max_jobs_per_site": 30,
+    "content_length_limit": 10000,
+    "crawl_individual_jobs": true,
+    "max_crawl_depth": 5,
+    "filter_software_roles_only": true,
+    "filter_israel_locations_only": true,
+    "verbose_logging": false,
+    "enable_job_crawling": true,
+    "sheets_batch_size": 10,
+    "sheets_write_delay": 6
+}
