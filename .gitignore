@@ -1,4 +1,6 @@
 *.txt
 logs
-bookmarks
+*.html
+*.md
+!README.md
 
