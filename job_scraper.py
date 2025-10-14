@@ -339,8 +339,8 @@ class CleanJobScraperV4:
             return True
         if re.search(r'\bapprentice\b', title_lower):  # "apprentice" as complete word
             return True
-    
-        return False    
+        
+        return False
 
     def is_entry_junior_position(self, title: str) -> bool:
         """Check if position is entry/junior level (Sheet2, bolded)"""
