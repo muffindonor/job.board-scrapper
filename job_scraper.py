@@ -24,20 +24,48 @@ from pathlib import Path
 import warnings
 import ollama
 from typing import List, Dict, Optional, Set, Tuple
+import sys
 
-class CleanJobScraperV4:
+class JobScraperV41:
     def __init__(self, config_file='config.json'):
-        """Clean, properly implemented job scraper V4"""
+        """Job scraper V4.1 with fail-fast Ollama check and new sheet organization"""
         self.config = self.load_config(config_file)
         self.setup_logging()
         self.existing_jobs = set()
         self.session = requests.Session()
         self.setup_session()
         self.setup_filters()
-        self.setup_google_sheets()
         self.current_year = datetime.now().year
 
+        # CRITICAL: Check Ollama connection at startup - FAIL FAST if not available
+        if not self.startup_ollama_check():
+            self.logger.error("💥 STOPPING: Cannot proceed without Ollama")
+            sys.exit(1)
+
+        self.setup_google_sheets()
         warnings.filterwarnings("ignore")
+
+    def startup_ollama_check(self) -> bool:
+        """Check Ollama connection at startup - FAIL FAST if not available"""
+        try:
+            self.logger.info("🤖 Testing Ollama connection...")
+            test_response = ollama.chat(
+                model=self.config['ollama_model'],
+                messages=[{'role': 'user', 'content': 'test'}]
+            )
+            self.logger.info(f"✅ Ollama ({self.config['ollama_model']}) connection successful")
+            return True
+        except Exception as e:
+            self.logger.error("❌ OLLAMA CONNECTION FAILED!")
+            self.logger.error(f"Error: {e}")
+            self.logger.error("")
+            self.logger.error("🚑 SOLUTION:")
+            self.logger.error("  1. Start Ollama service: ollama serve")
+            self.logger.error(f"  2. Pull model: ollama pull {self.config['ollama_model']}")
+            self.logger.error(f"  3. Test: ollama run {self.config['ollama_model']}")
+            self.logger.error("  4. Then run this program again")
+            self.logger.error("")
+            return False
 
     def setup_google_sheets(self):
         """Initialize Google Sheets connection"""
@@ -129,10 +157,10 @@ class CleanJobScraperV4:
             self.logger.error(f"❌ Sheet formatting error: {e}")
 
     def load_existing_jobs_from_sheets(self):
-        """Load existing jobs from both Sheet2 and Sheet3"""
+        """Load existing jobs from all sheets (Sheet2, Sheet3, Sheet4)"""
         existing_jobs = set()
 
-        for sheet_name in ["Sheet2", "Sheet3"]:
+        for sheet_name in ["Sheet2", "Sheet3", "Sheet4"]:
             try:
                 headers = ['Title', 'Company', 'Date Posted', 'Description', 'Qualifications', 'Location', 'URL', 'Date Added']
                 worksheet = self.get_or_create_worksheet(sheet_name, headers)
@@ -179,7 +207,7 @@ class CleanJobScraperV4:
             "embedded software", "firmware engineer", "game developer", "blockchain developer"
         }
 
-        # Israeli cities - WHITELIST ONLY (no exclusion lists needed)
+        # Israeli cities - WHITELIST ONLY
         self.israeli_cities = {
             "jerusalem", "tel aviv", "tel aviv-yafo", "haifa", "petah tikva", "rishon lezion",
             "netanya", "ashdod", "bnei brak", "beersheba", "beer sheva", "holon", "ramat gan",
@@ -279,7 +307,7 @@ class CleanJobScraperV4:
         return False
 
     def is_israeli_location(self, location: str) -> bool:
-        """STRICT whitelist-only approach - no redundant exclusion lists"""
+        """STRICT whitelist-only approach"""
         if not self.config.get('filter_israel_locations_only', True):
             return True
 
@@ -302,10 +330,7 @@ class CleanJobScraperV4:
         return False
 
     def parse_job_date(self, date_string: str) -> Tuple[bool, str]:
-        """
-        Parse job date and validate it's from current year
-        Returns: (is_valid, formatted_date_or_indicator)
-        """
+        """Parse job date and validate it's from current year"""
         if not date_string or date_string.strip() == "":
             return True, "**PDNA**"  # Post Date Not Available
 
@@ -323,12 +348,17 @@ class CleanJobScraperV4:
         # If no year found, accept with PDNA indicator
         return True, "**PDNA**"
 
-    def is_student_intern_position(self, title: str) -> bool:
-        """Check if position is specifically for students/interns (Sheet3) - FIXED"""
-        import re
+    # NEW SHEET ORGANIZATION - V4.1
+    def is_senior_position(self, title: str) -> bool:
+        """Check if position is senior level (Sheet4)"""
         title_lower = title.lower()
-        
-        # Use word boundaries to match whole words only
+        return 'senior' in title_lower
+
+    def is_student_intern_position(self, title: str) -> bool:
+        """Check if position is for students/interns (Sheet2) - FIXED REGEX"""
+        title_lower = title.lower()
+
+        # FIXED: Use word boundaries to avoid "internet" false positive
         if re.search(r'\bintern\b', title_lower):      # "intern" as complete word
             return True
         if re.search(r'\binternship\b', title_lower):  # "internship" as complete word
@@ -339,16 +369,30 @@ class CleanJobScraperV4:
             return True
         if re.search(r'\bapprentice\b', title_lower):  # "apprentice" as complete word
             return True
-        
+
         return False
 
     def is_entry_junior_position(self, title: str) -> bool:
-        """Check if position is entry/junior level (Sheet2, bolded)"""
+        """Check if position is entry/junior level (Sheet3)"""
         if self.is_student_intern_position(title):
-            return False  # These go to Sheet3, not Sheet2
+            return False  # These go to Sheet2, not Sheet3
+        if self.is_senior_position(title):
+            return False  # These go to Sheet4, not Sheet3
+
         title_lower = title.lower()
         entry_keywords = ['entry', 'junior', 'graduate', 'new grad', 'fresh', 'associate']
         return any(keyword in title_lower for keyword in entry_keywords)
+
+    def categorize_job(self, title: str) -> str:
+        """Categorize job into appropriate sheet - NEW V4.1 LOGIC"""
+        if self.is_senior_position(title):
+            return "Sheet4"  # Senior positions
+        elif self.is_student_intern_position(title):
+            return "Sheet2"  # Student/Intern positions (SWAPPED)
+        elif self.is_entry_junior_position(title):
+            return "Sheet3"  # Entry/Graduate positions (SWAPPED)
+        else:
+            return "Sheet3"  # Default: Regular jobs go with entry jobs
 
     def create_silent_chrome_driver(self):
         """Create silent Chrome driver"""
@@ -403,7 +447,7 @@ class CleanJobScraperV4:
         return urls
 
     def scrape_with_requests(self, url):
-        """Scrape with requests - FIXED: Only returns on success or final failure"""
+        """Scrape with requests - Only returns on success or final failure"""
         for attempt in range(self.config['max_retries']):
             try:
                 response = self.session.get(url, timeout=self.config['timeout'])
@@ -512,6 +556,7 @@ Return ONLY this JSON (no markdown, no extra text):
 """
 
         try:
+            self.logger.debug(f"🤖 Analyzing {company_name} with Ollama...")
             response = ollama.chat(
                 model=self.config['ollama_model'],
                 messages=[{'role': 'user', 'content': prompt}]
@@ -519,9 +564,11 @@ Return ONLY this JSON (no markdown, no extra text):
 
             job_data = self.extract_json_from_llm_response(response['message']['content'])
             if not job_data:
+                self.logger.debug(f"⚠️ No valid JSON from {company_name}")
                 return []
 
             jobs = job_data.get('jobs', [])
+            self.logger.debug(f"📊 Extracted {len(jobs)} potential jobs from {company_name}")
 
             # Apply all filters
             filtered_jobs = []
@@ -532,15 +579,18 @@ Return ONLY this JSON (no markdown, no extra text):
 
                 # Software engineering role check
                 if not self.is_software_engineering_role(job.get('title', '')):
+                    self.logger.debug(f"⚠️ Non-SW role filtered: {job.get('title', '')}")
                     continue
 
                 # Location check (STRICT)
                 if not self.is_israeli_location(job.get('location', '')):
+                    self.logger.debug(f"⚠️ Non-Israeli location: {job.get('location', '')}")
                     continue
 
                 # Date validation
                 date_valid, formatted_date = self.parse_job_date(job.get('date_posted', ''))
                 if not date_valid:
+                    self.logger.debug(f"⚠️ Old job filtered: {job.get('date_posted', '')}")
                     continue  # Skip old jobs
 
                 job['date_posted'] = formatted_date
@@ -551,14 +601,17 @@ Return ONLY this JSON (no markdown, no extra text):
 
                 filtered_jobs.append(job)
 
+            if filtered_jobs:
+                self.logger.debug(f"✅ {len(filtered_jobs)} jobs passed all filters from {company_name}")
+
             return filtered_jobs
 
         except Exception as e:
-            self.logger.debug(f"Ollama error: {e}")
+            self.logger.error(f"❌ Ollama analysis failed for {company_name}: {e}")
             return []
 
     def scrape_company_jobs(self, url):
-        """Scrape jobs - FIXED: Selenium only runs if requests fails"""
+        """Scrape jobs - Selenium only runs if requests fails"""
         self.logger.info(f"🔍 {urlparse(url).netloc}")
 
         # Try requests first
@@ -573,7 +626,7 @@ Return ONLY this JSON (no markdown, no extra text):
             self.logger.warning(f"⚠️ Failed to scrape {urlparse(url).netloc}")
             return []
 
-        # Analyze content
+        # Analyze content with Ollama
         jobs = self.enhanced_ollama_analysis(scraped_content, url)
 
         # Filter duplicates
@@ -624,8 +677,8 @@ Return ONLY this JSON (no markdown, no extra text):
                     title = row_data[0]
 
                     try:
-                        # Bold for entry/junior in Sheet2
-                        if sheet_type == "Sheet2" and self.is_entry_junior_position(title):
+                        # Bold for entry/junior in Sheet3 (not Sheet2 for interns)
+                        if sheet_type == "Sheet3" and self.is_entry_junior_position(title):
                             worksheet.format(f'A{row_number}', {
                                 'textFormat': {'bold': True},
                                 'wrapStrategy': 'WRAP'
@@ -672,31 +725,37 @@ Return ONLY this JSON (no markdown, no extra text):
         return False
 
     def save_jobs_to_sheets(self, all_jobs):
-        """Save jobs to appropriate sheets with rate limiting"""
+        """Save jobs to appropriate sheets with NEW V4.1 categorization"""
         if not all_jobs or not self.gc:
             return
 
-        # Separate jobs by type
-        student_intern_jobs = []
-        regular_jobs = []
+        # NEW: Categorize jobs into 3 sheets
+        sheet2_jobs = []  # Student/Intern
+        sheet3_jobs = []  # Entry/Junior + Regular
+        sheet4_jobs = []  # Senior
 
         for job in all_jobs:
-            if self.is_student_intern_position(job['title']):
-                student_intern_jobs.append(job)
-            else:
-                regular_jobs.append(job)
+            sheet = self.categorize_job(job['title'])
+            if sheet == "Sheet2":
+                sheet2_jobs.append(job)
+            elif sheet == "Sheet3":
+                sheet3_jobs.append(job)
+            elif sheet == "Sheet4":
+                sheet4_jobs.append(job)
 
         headers = ['Title', 'Company', 'Date Posted', 'Description', 'Qualifications', 'Location', 'URL', 'Date Added']
 
-        # Save to Sheet2 (regular jobs)
-        if regular_jobs:
-            self.save_to_sheet("Sheet2", regular_jobs, headers)
+        # Save to appropriate sheets
+        if sheet2_jobs:
+            self.save_to_sheet("Sheet2", sheet2_jobs, headers, "Student/Intern")
 
-        # Save to Sheet3 (student/intern)
-        if student_intern_jobs:
-            self.save_to_sheet("Sheet3", student_intern_jobs, headers)
+        if sheet3_jobs:
+            self.save_to_sheet("Sheet3", sheet3_jobs, headers, "Entry/Regular")
 
-    def save_to_sheet(self, sheet_name, jobs, headers):
+        if sheet4_jobs:
+            self.save_to_sheet("Sheet4", sheet4_jobs, headers, "Senior")
+
+    def save_to_sheet(self, sheet_name, jobs, headers, category):
         """Save jobs to specific sheet"""
         try:
             worksheet = self.get_or_create_worksheet(sheet_name, headers)
@@ -706,7 +765,7 @@ Return ONLY this JSON (no markdown, no extra text):
             batch_size = self.config.get('sheets_batch_size', 10)
             delay = self.config.get('sheets_write_delay', 6)
 
-            self.logger.info(f"💾 Saving {len(jobs)} jobs to {sheet_name}")
+            self.logger.info(f"💾 Saving {len(jobs)} {category} jobs to {sheet_name}")
 
             # Prepare rows
             all_rows = []
@@ -745,9 +804,9 @@ Return ONLY this JSON (no markdown, no extra text):
             self.logger.error(f"❌ Error saving to {sheet_name}: {e}")
 
     def run(self):
-        """Main execution"""
+        """Main execution with fail-fast Ollama check"""
         start_time = datetime.now()
-        self.logger.info("🚀 Clean Job Scraper V4")
+        self.logger.info("🚀 Job Scraper V4.1 - Enhanced with Fail-Fast Ollama Check")
 
         if not self.gc:
             self.logger.error("❌ Google Sheets not configured")
@@ -759,6 +818,11 @@ Return ONLY this JSON (no markdown, no extra text):
         if not urls:
             self.logger.error("❌ No URLs")
             return
+
+        self.logger.info(f"📊 NEW SHEET ORGANIZATION:")
+        self.logger.info(f"  • Sheet2: Student/Intern positions")
+        self.logger.info(f"  • Sheet3: Entry/Junior + Regular positions (bold entry)")
+        self.logger.info(f"  • Sheet4: Senior positions")
 
         all_jobs = []
 
@@ -785,10 +849,12 @@ Return ONLY this JSON (no markdown, no extra text):
 
 def main():
     try:
-        scraper = CleanJobScraperV4()
+        scraper = JobScraperV41()
         scraper.run()
     except KeyboardInterrupt:
         logging.info("⚠️ Interrupted")
+    except SystemExit:
+        pass  # Allow sys.exit() from Ollama check
     except Exception as e:
         logging.error(f"💥 Error: {e}")
 
