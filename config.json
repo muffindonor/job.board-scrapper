@@ -17,5 +17,6 @@
     "verbose_logging": false,
     "enable_job_crawling": true,
     "sheets_batch_size": 10,
-    "sheets_write_delay": 6
+    "sheets_write_delay": 6,
+    "filter_by_current_year": true
 }

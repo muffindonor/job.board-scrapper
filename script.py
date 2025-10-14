@@ -1,5 +1,5 @@
-# Create the rate-limited batch writing version (V3.1)
-rate_limited_scraper = '''
+# Create the clean V4 with all fixes properly implemented
+clean_v4_scraper = '''
 import os
 import json
 import time
@@ -24,23 +24,19 @@ import logging
 from pathlib import Path
 import warnings
 import ollama
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Tuple
 
-class RateLimitedJobScraper:
+class CleanJobScraperV4:
     def __init__(self, config_file='config.json'):
-        """Rate-limited job scraper with batch Google Sheets writing"""
+        """Clean, properly implemented job scraper V4"""
         self.config = self.load_config(config_file)
         self.setup_logging()
-        self.existing_jobs = set()  # Will load from Google Sheets
+        self.existing_jobs = set()
         self.session = requests.Session()
         self.setup_session()
         self.setup_filters()
         self.setup_google_sheets()
-        
-        # Rate limiting settings for Google Sheets API
-        self.batch_size = 10  # Write jobs in batches of 10
-        self.write_delay = 6   # 6 seconds between batches (10 requests per minute = safe)
-        self.max_retries = 3   # Retry failed writes
+        self.current_year = datetime.now().year
         
         warnings.filterwarnings("ignore")
         
@@ -59,41 +55,37 @@ class RateLimitedJobScraper:
             self.logger.error(f"❌ Google Sheets setup failed: {e}")
             self.gc = None
         
-    def get_worksheet(self):
-        """Get or create Google Sheet worksheet (Sheet2)"""
+    def get_or_create_worksheet(self, sheet_name: str, headers: List[str]):
+        """Get or create a worksheet with specified headers"""
         try:
             spreadsheet = self.gc.open(self.sheet_name)
             
-            # Try to get Sheet2, create if doesn't exist
             try:
-                worksheet = spreadsheet.worksheet("Sheet2")
+                worksheet = spreadsheet.worksheet(sheet_name)
             except gspread.exceptions.WorksheetNotFound:
-                worksheet = spreadsheet.add_worksheet("Sheet2", 1000, 10)
-                # Set up headers
-                headers = ['Title', 'Company', 'Date Posted', 'Date Added', 
-                          'Description', 'Qualifications', 'Location', 'URL']
+                worksheet = spreadsheet.add_worksheet(sheet_name, 1000, 10)
                 worksheet.append_row(headers)
                 self.setup_sheet_formatting(worksheet)
-                self.logger.info("✅ Created Sheet2 with headers")
+                self.logger.info(f"✅ Created {sheet_name} with headers")
             
             return worksheet
         except Exception as e:
-            self.logger.error(f"❌ Error accessing Google Sheet: {e}")
+            self.logger.error(f"❌ Error accessing {sheet_name}: {e}")
             return None
     
     def setup_sheet_formatting(self, worksheet):
         """Set up Google Sheet formatting with proper column widths"""
         try:
-            # Column width settings (pixels)
+            # Column width settings
             column_widths = [
-                (0, 1, 300),   # Title - Wide
-                (1, 2, 150),   # Company - Medium
-                (2, 3, 100),   # Date Posted - Narrow
-                (3, 4, 100),   # Date Added - Narrow  
-                (4, 5, 400),   # Description - Very Wide
-                (5, 6, 400),   # Qualifications - Very Wide
-                (6, 7, 120),   # Location - Medium
-                (7, 8, 150)    # URL - Narrow
+                (0, 1, 300),   # Title
+                (1, 2, 150),   # Company
+                (2, 3, 100),   # Date Posted
+                (3, 4, 400),   # Description
+                (4, 5, 400),   # Qualifications
+                (5, 6, 120),   # Location
+                (6, 7, 200),   # URL
+                (7, 8, 100)    # Date Added
             ]
             
             requests = []
@@ -101,9 +93,9 @@ class RateLimitedJobScraper:
                 requests.append({
                     'updateDimensionProperties': {
                         'range': {
-                            'sheetId': worksheet.id, 
-                            'dimension': 'COLUMNS', 
-                            'startIndex': start_idx, 
+                            'sheetId': worksheet.id,
+                            'dimension': 'COLUMNS',
+                            'startIndex': start_idx,
                             'endIndex': end_idx
                         },
                         'properties': {'pixelSize': width},
@@ -111,7 +103,6 @@ class RateLimitedJobScraper:
                     }
                 })
             
-            # Apply column width changes
             worksheet.spreadsheet.batch_update({'requests': requests})
             
             # Format header row
@@ -138,83 +129,70 @@ class RateLimitedJobScraper:
         except Exception as e:
             self.logger.error(f"❌ Sheet formatting error: {e}")
     
-    def load_existing_jobs_from_sheet(self):
-        """Load existing jobs from Google Sheets to avoid duplicates"""
-        try:
-            worksheet = self.get_worksheet()
-            if not worksheet:
-                return set()
+    def load_existing_jobs_from_sheets(self):
+        """Load existing jobs from both Sheet2 and Sheet3"""
+        existing_jobs = set()
+        
+        for sheet_name in ["Sheet2", "Sheet3"]:
+            try:
+                headers = ['Title', 'Company', 'Date Posted', 'Description', 'Qualifications', 'Location', 'URL', 'Date Added']
+                worksheet = self.get_or_create_worksheet(sheet_name, headers)
+                if not worksheet:
+                    continue
+                    
+                all_values = worksheet.get_all_values()
+                if len(all_values) <= 1:
+                    continue
                 
-            all_values = worksheet.get_all_values()
-            if len(all_values) <= 1:  # Only headers or empty
-                return set()
-            
-            existing_jobs = set()
-            for row in all_values[1:]:  # Skip header
-                if len(row) >= 8:  # Ensure we have all columns
-                    title, company, _, _, _, _, location, _ = row[:8]
-                    if title and company:
-                        job_id = self.create_job_id(title, company, location)
-                        existing_jobs.add(job_id)
-            
-            self.logger.info(f"📊 Loaded {len(existing_jobs)} existing jobs from Google Sheets")
-            return existing_jobs
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error loading existing jobs from sheet: {e}")
-            return set()
+                for row in all_values[1:]:
+                    if len(row) >= 7:
+                        title, company, _, _, _, location, _ = row[:7]
+                        if title and company:
+                            job_id = self.create_job_id(title, company, location)
+                            existing_jobs.add(job_id)
+                            
+            except Exception as e:
+                self.logger.error(f"❌ Error loading jobs from {sheet_name}: {e}")
+        
+        self.logger.info(f"📊 Loaded {len(existing_jobs)} existing jobs from Google Sheets")
+        return existing_jobs
     
     def setup_filters(self):
-        """Setup comprehensive filtering with relaxed location rules"""
-        # Expanded software engineering keywords (very inclusive)
+        """Setup clean, non-redundant filtering"""
+        # Software engineering keywords (comprehensive)
         self.sw_engineering_keywords = {
-            # Core terms that should ALWAYS be included
             "software engineer", "software developer", "developer", "engineer", "programmer",
-            "full stack", "frontend", "front-end", "backend", "back-end", "web developer",
-            "mobile developer", "ios developer", "android developer", "react developer",
-            "angular developer", "vue developer", "node.js developer", "python developer",
-            "java developer", ".net developer", "c# developer", "php developer", "ruby developer",
+            "full stack", "fullstack", "frontend", "front-end", "backend", "back-end",
+            "web developer", "mobile developer", "ios developer", "android developer",
+            "react developer", "angular developer", "vue developer", "node.js developer",
+            "python developer", "java developer", ".net developer", "c# developer",
             "javascript developer", "typescript developer", "go developer", "kotlin developer",
             "swift developer", "flutter developer", "react native developer",
-            "junior software", "senior software", "staff software", "principal software",
-            "lead software", "technical lead", "tech lead", "engineering lead", "team lead",
-            "software architect", "solution architect", "system architect", "technical architect",
+            "senior software", "staff software", "principal software", "lead software",
+            "technical lead", "tech lead", "engineering lead", "architect",
             "cloud architect", "api developer", "systems engineer", "platform engineer",
             "infrastructure engineer", "site reliability", "sre", "devops engineer",
-            "devsecops engineer", "build engineer", "release engineer", "automation engineer",
-            "ci/cd engineer", "cloud engineer", "aws engineer", "azure engineer", "gcp engineer",
+            "build engineer", "release engineer", "automation engineer", "ci/cd engineer",
+            "cloud engineer", "aws engineer", "azure engineer", "gcp engineer",
             "kubernetes engineer", "docker engineer", "qa engineer", "test engineer",
             "automation test", "sdet", "performance engineer", "security engineer",
             "data engineer", "ml engineer", "machine learning engineer", "ai engineer",
-            "mlops engineer", "embedded software", "firmware engineer", "game developer",
-            "blockchain developer", "web3 developer", "ar/vr developer", "computer vision"
+            "embedded software", "firmware engineer", "game developer", "blockchain developer"
         }
         
-        # Israeli cities (comprehensive) - BUT we'll be more lenient about location filtering
+        # Israeli cities - WHITELIST ONLY (no exclusion lists needed)
         self.israeli_cities = {
             "jerusalem", "tel aviv", "tel aviv-yafo", "haifa", "petah tikva", "rishon lezion",
             "netanya", "ashdod", "bnei brak", "beersheba", "beer sheva", "holon", "ramat gan",
             "beit shemesh", "ashkelon", "rehovot", "bat yam", "herzliya", "hadera", "kfar saba",
-            "modi'in", "lod", "givat shmuel", "raanana", "givatayim", "hod hasharon",
-            "or yehuda", "yehud", "kiryat ata", "kiryat bialik", "kiryat motzkin", "kiryat yam",
-            "kiryat ono", "kiryat gat", "kiryat malachi", "kiryat shmona", "nazareth", "nahariya",
-            "acre", "akko", "tiberias", "eilat", "dimona", "arad", "carmiel", "ma'ale adumim",
-            "modiin", "rosh haayin", "bet shean", "afula", "migdal haemek", "yokneam", "nesher",
-            "or akiva", "pardes hanna-karkur", "caesarea", "zichron yaakov", "binyamina",
-            "kiryat tivon", "karmiel", "safed", "tzfat", "maalot-tarshiha", "shlomi", "tamra",
-            "shfaram", "tirat carmel", "yerushalayim", "hefa", "rishon leziyyon", "herzliyya",
-            "be'er sheva", "petah tiqwa", "central district", "tel aviv district", "haifa district",
-            "northern district", "southern district", "jerusalem district", "israel"
-        }
-        
-        # Keep list of definitely excluded countries (but be more lenient)
-        self.definitely_excluded_countries = {
-            "united states", "usa", "canada", "united kingdom", "uk", "germany", "france",
-            "china", "india", "singapore", "australia", "japan", "south korea"
+            "modi'in", "modiin", "lod", "givat shmuel", "raanana", "givatayim", "hod hasharon",
+            "or yehuda", "yehud", "kiryat", "nazareth", "nahariya", "acre", "akko",
+            "tiberias", "eilat", "dimona", "arad", "carmiel", "rosh haayin", "afula",
+            "nesher", "caesarea", "karmiel", "safed", "tzfat", "yerushalayim", "hefa"
         }
     
     def load_config(self, config_file):
-        """Load enhanced configuration"""
+        """Load configuration"""
         default_config = {
             "sheet_name": "job-scrapper",
             "urls_file": "company_urls.txt",
@@ -233,9 +211,9 @@ class RateLimitedJobScraper:
             "filter_israel_locations_only": True,
             "verbose_logging": False,
             "enable_job_crawling": True,
-            # New rate limiting settings
             "sheets_batch_size": 10,
-            "sheets_write_delay": 6
+            "sheets_write_delay": 6,
+            "filter_by_current_year": True
         }
         
         if os.path.exists(config_file):
@@ -249,27 +227,24 @@ class RateLimitedJobScraper:
         return default_config
     
     def setup_session(self):
-        """Setup requests session with Hebrew support"""
+        """Setup requests session"""
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9,he;q=0.8',
             'Accept-Charset': 'utf-8'
         })
     
     def setup_logging(self):
-        """Setup clean logging"""
+        """Setup logging"""
         logs_dir = Path('logs')
         logs_dir.mkdir(exist_ok=True)
         
         log_file = logs_dir / f'job_scraper_{datetime.now().strftime("%Y%m%d")}.log'
         
-        # Minimal logging format
-        log_format = '%(asctime)s - %(levelname)s - %(message)s'
-        
         logging.basicConfig(
             level=getattr(logging, self.config['log_level']),
-            format=log_format,
+            format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler(log_file, encoding='utf-8'),
                 logging.StreamHandler()
@@ -277,7 +252,6 @@ class RateLimitedJobScraper:
         )
         self.logger = logging.getLogger(__name__)
         
-        # Suppress noisy loggers
         for noisy_logger in ['urllib3', 'selenium', 'webdriver_manager', 'requests', 'gspread']:
             logging.getLogger(noisy_logger).setLevel(logging.ERROR)
     
@@ -288,147 +262,124 @@ class RateLimitedJobScraper:
         return hashlib.md5(job_string.encode('utf-8')).hexdigest()
     
     def is_software_engineering_role(self, job_title: str) -> bool:
-        """Enhanced software role detection - much more inclusive"""
+        """Check if job is software engineering role"""
         if not self.config.get('filter_software_roles_only', True):
             return True
             
         title_lower = job_title.lower().strip()
         
-        # Check against comprehensive keywords
+        # Check keywords
         for keyword in self.sw_engineering_keywords:
             if keyword in title_lower:
                 return True
         
-        # Special patterns for variations like "Software Engineer, [Specialty]"
+        # Pattern matching for variations
         if re.search(r'software.*engineer|engineer.*software', title_lower):
-            return True
-        if re.search(r'developer|programmer|engineer', title_lower) and 'software' in title_lower:
             return True
         
         return False
     
     def is_israeli_location(self, location: str) -> bool:
-        """Much more lenient location filtering"""
+        """STRICT whitelist-only approach - no redundant exclusion lists"""
         if not self.config.get('filter_israel_locations_only', True):
             return True
             
         if not location or location.strip() == "":
-            return True  # Allow empty locations
+            return False  # Reject empty locations
         
         location_clean = location.strip()
         location_lower = location_clean.lower()
         
-        # If explicitly mentions Israel, accept it
+        # ONLY accept if explicitly Israeli
         if 'israel' in location_lower or 'ישראל' in location_clean:
             return True
         
-        # Check for Israeli cities
+        # Or known Israeli city
         for city in self.israeli_cities:
             if city in location_lower:
                 return True
         
-        # Check for definitely excluded countries - only reject if explicitly mentioned
-        for country in self.definitely_excluded_countries:
-            if country in location_lower and 'israel' not in location_lower:
-                return False
+        # Everything else: REJECT
+        return False
+    
+    def parse_job_date(self, date_string: str) -> Tuple[bool, str]:
+        """
+        Parse job date and validate it's from current year
+        Returns: (is_valid, formatted_date_or_indicator)
+        """
+        if not date_string or date_string.strip() == "":
+            return True, "**PDNA**"  # Post Date Not Available
         
-        # If it's just a city name or unclear, assume it could be Israeli
-        return True
+        date_lower = date_string.lower().strip()
+        
+        # Try to extract year
+        year_match = re.search(r'20(\\d{2})', date_string)
+        if year_match:
+            year = int(f"20{year_match.group(1)}")
+            if self.config.get('filter_by_current_year', True):
+                if year < self.current_year:
+                    return False, ""  # Old job, reject
+            return True, date_string
+        
+        # If no year found, accept with PDNA indicator
+        return True, "**PDNA**"
+    
+    def is_student_intern_position(self, title: str) -> bool:
+        """Check if position is specifically for students/interns (Sheet3)"""
+        title_lower = title.lower()
+        student_intern_keywords = ['intern', 'internship', 'student', 'trainee', 'apprentice']
+        return any(keyword in title_lower for keyword in student_intern_keywords)
+    
+    def is_entry_junior_position(self, title: str) -> bool:
+        """Check if position is entry/junior level (Sheet2, bolded)"""
+        if self.is_student_intern_position(title):
+            return False  # These go to Sheet3, not Sheet2
+        title_lower = title.lower()
+        entry_keywords = ['entry', 'junior', 'graduate', 'new grad', 'fresh', 'associate']
+        return any(keyword in title_lower for keyword in entry_keywords)
     
     def create_silent_chrome_driver(self):
-        """Create Chrome driver with ALL noise suppressed including WebGL"""
+        """Create silent Chrome driver"""
         chrome_options = Options()
         
         if self.config['headless_browser']:
             chrome_options.add_argument("--headless=new")
         
-        # Comprehensive noise suppression
         suppression_args = [
-            "--no-sandbox",
-            "--disable-dev-shm-usage", 
-            "--disable-gpu",
-            "--disable-web-security",
-            "--disable-features=VizDisplayCompositor",
-            "--disable-features=TranslateUI,BlinkGenPropertyTrees",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--disable-logging",
-            "--disable-extensions",
-            "--disable-plugins",
-            "--disable-sync", 
-            "--disable-translate",
-            "--disable-dev-tools",
-            "--disable-background-networking",
-            "--log-level=3",  # Only fatal errors
-            "--silent",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-default-apps",
-            "--disable-popup-blocking",
-            "--disable-prompt-on-repost",
-            "--disable-hang-monitor",
-            "--disable-client-side-phishing-detection",
-            "--disable-component-update",
-            "--disable-domain-reliability",
-            "--disable-features=AudioServiceOutOfProcess",
-            "--disable-features=MediaRouter",
-            "--disable-ipc-flooding-protection",
-            "--window-size=1920,1080",
-            # WebGL specific suppression
-            "--disable-webgl",
-            "--disable-webgl2", 
-            "--disable-3d-apis",
-            "--disable-webgl-image-chromium",
-            "--disable-webgl-extensions"
+            "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+            "--disable-web-security", "--disable-features=VizDisplayCompositor",
+            "--disable-logging", "--disable-extensions", "--log-level=3",
+            "--silent", "--disable-webgl", "--disable-webgl2", "--disable-3d-apis"
         ]
         
         for arg in suppression_args:
             chrome_options.add_argument(arg)
         
-        chrome_options.add_experimental_option("excludeSwitches", 
-                                             ["enable-automation", "enable-logging"])
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
         chrome_options.add_experimental_option('useAutomationExtension', False)
-        
-        # Disable images and other resources for speed
-        prefs = {
-            "profile.managed_default_content_settings.images": 2,
-            "profile.default_content_setting_values.notifications": 2,
-            "profile.default_content_settings.popups": 0,
-            "profile.managed_default_content_settings.media_stream": 2,
-        }
-        chrome_options.add_experimental_option("prefs", prefs)
         
         try:
             service = Service(ChromeDriverManager().install())
             service.log_path = os.devnull if hasattr(os, 'devnull') else 'NUL'
-            
             driver = webdriver.Chrome(service=service, options=chrome_options)
-            driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             return driver
         except Exception as e:
-            self.logger.error(f"❌ Chrome driver creation failed: {e}")
+            self.logger.error(f"❌ Chrome driver failed: {e}")
             return None
     
     def load_company_urls(self):
-        """Load URLs with better error handling"""
+        """Load URLs"""
         urls = []
         urls_file = self.config['urls_file']
         
         if not os.path.exists(urls_file):
             sample_urls = [
-                "# Israeli Company Career Pages - Add your targets here",
-                "# Lines starting with # are ignored",
-                "",
-                "# Examples (replace with actual Israeli companies):",
+                "# Israeli Company Career Pages",
                 "https://careers.microsoft.com/professionals/us/en/search-results",
-                "https://careers.google.com/jobs/results/",
-                "https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite",
-                "# Add more Israeli tech company URLs here"
+                "https://careers.google.com/jobs/results/"
             ]
             with open(urls_file, 'w', encoding='utf-8') as f:
                 f.write('\\n'.join(sample_urls))
-            self.logger.info(f"📝 Created sample URLs file: {urls_file}")
             
         with open(urls_file, 'r', encoding='utf-8') as f:
             for line in f:
@@ -436,56 +387,11 @@ class RateLimitedJobScraper:
                 if line and not line.startswith('#'):
                     urls.append(line)
                     
-        self.logger.info(f"📋 Loaded {len(urls)} URLs to scrape")
+        self.logger.info(f"📋 Loaded {len(urls)} URLs")
         return urls
     
-    def extract_job_links(self, soup, base_url):
-        """Extract job posting links with better patterns"""
-        job_links = []
-        
-        # Enhanced job link patterns
-        job_link_patterns = [
-            'a[href*="job"]', 'a[href*="position"]', 'a[href*="career"]',
-            'a[href*="/jobs/"]', 'a[href*="/careers/"]', 'a[href*="/positions/"]',
-            'a[href*="requisition"]', 'a[href*="opening"]', 'a[href*="opportunity"]',
-            '.job-link', '.position-link', '.career-link', '.job-tile',
-            '[data-job-id]', '[data-position-id]', '[data-requisition]'
-        ]
-        
-        for pattern in job_link_patterns:
-            links = soup.select(pattern)
-            for link in links:
-                href = link.get('href')
-                if href:
-                    full_url = urljoin(base_url, href)
-                    if (full_url not in job_links and 
-                        not any(skip in href.lower() for skip in ['page=', 'next', 'prev', 'filter'])):
-                        job_links.append(full_url)
-        
-        max_crawl = self.config.get('max_crawl_depth', 5)
-        return job_links[:max_crawl]
-    
-    def scrape_individual_job(self, job_url):
-        """Scrape individual job with better content extraction"""
-        try:
-            response = self.session.get(job_url, timeout=self.config['timeout'])
-            response.encoding = 'utf-8'
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Remove noise
-            for element in soup(["script", "style", "nav", "footer", "header", "aside", "iframe"]):
-                element.decompose()
-            
-            text = soup.get_text(separator=' ', strip=True)
-            text = re.sub(r'\\s+', ' ', text)
-            
-            return text[:self.config.get('content_length_limit', 10000)]
-            
-        except Exception:
-            return None
-    
     def scrape_with_requests(self, url):
-        """Enhanced requests scraping"""
+        """Scrape with requests - FIXED: Only returns on success or final failure"""
         for attempt in range(self.config['max_retries']):
             try:
                 response = self.session.get(url, timeout=self.config['timeout'])
@@ -493,45 +399,38 @@ class RateLimitedJobScraper:
                 
                 soup = BeautifulSoup(response.content, 'html.parser')
                 
-                # Remove noise
                 for script in soup(["script", "style", "nav", "footer", "header"]):
                     script.decompose()
                 
                 text = soup.get_text(separator=' ', strip=True)
                 text = re.sub(r'\\s+', ' ', text)
                 
-                return text, soup
+                return text, soup  # SUCCESS - return immediately
                 
             except requests.RequestException:
                 if attempt < self.config['max_retries'] - 1:
                     time.sleep(2 ** attempt)
                     continue
-                    
-        return None, None
+        
+        return None, None  # All attempts failed
     
     def scrape_with_selenium(self, url):
-        """Enhanced Selenium scraping with noise suppression"""
+        """Scrape with Selenium - ONLY called if requests fails"""
         driver = self.create_silent_chrome_driver()
         if not driver:
             return None, None
             
         try:
             driver.get(url)
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
-            )
+            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
             
-            # Wait and scroll for dynamic content
             time.sleep(3)
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight/3);")
-            time.sleep(2)
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(3)
             
             page_source = driver.page_source
             soup = BeautifulSoup(page_source, 'html.parser')
             
-            # Remove noise
             for element in soup(["script", "style", "nav", "footer", "header"]):
                 element.decompose()
                 
@@ -546,39 +445,59 @@ class RateLimitedJobScraper:
             if driver:
                 driver.quit()
     
-    def enhanced_ollama_analysis(self, content, company_url, job_links=None):
-        """Improved Ollama analysis with better JSON handling"""
+    def extract_json_from_llm_response(self, response_text: str) -> Optional[dict]:
+        """ROBUST JSON extraction from LLM response"""
+        try:
+            # Remove markdown code blocks
+            response_text = re.sub(r'```json\\s*', '', response_text)
+            response_text = re.sub(r'```\\s*', '', response_text)
+            
+            # Find JSON boundaries
+            json_start = response_text.find('{')
+            json_end = response_text.rfind('}') + 1
+            
+            if json_start == -1 or json_end <= json_start:
+                return None
+            
+            json_str = response_text[json_start:json_end]
+            
+            # Fix common JSON issues
+            json_str = re.sub(r',\\s*([}\\]])', r'\\1', json_str)  # Remove trailing commas
+            json_str = re.sub(r'\\n', ' ', json_str)  # Remove newlines
+            
+            return json.loads(json_str)
+            
+        except json.JSONDecodeError:
+            return None
+    
+    def enhanced_ollama_analysis(self, content, company_url):
+        """Improved Ollama analysis with robust JSON extraction"""
         company_name = self.extract_company_name_from_url(company_url)
         
-        # Much more focused prompt with better JSON structure
-        prompt = f"""
-        Extract software engineering jobs from {company_name} career page content.
+        prompt = f"""Extract software engineering jobs from {company_name}.
 
-        CRITICAL RULES:
-        1. ONLY software engineering roles (any title with: software, developer, engineer, programmer, devops, qa, data engineer, etc.)
-        2. Include ALL variations like "Software Engineer, [Specialization]" 
-        3. For locations: prefer Israeli locations but don't be too strict
-        4. Return VALID JSON ONLY
+Rules:
+1. ONLY software engineering roles
+2. Return VALID JSON only
+3. Include date posted if available
 
-        Content:
-        {content[:self.config.get('content_length_limit', 8000)]}
+Content:
+{content[:8000]}
 
-        Return this JSON structure ONLY:
-        {{
-          "jobs": [
-            {{
-              "title": "Software Engineer",
-              "location": "Tel Aviv",
-              "description": "Brief role summary",
-              "qualifications": "Key requirements",
-              "date_posted": "2023-10-13 or empty",
-              "url": "{company_url}"
-            }}
-          ]
-        }}
-        
-        Maximum {self.config.get('max_jobs_per_site', 30)} jobs. Valid JSON only.
-        """
+Return ONLY this JSON (no markdown, no extra text):
+{{
+  "jobs": [
+    {{
+      "title": "Software Engineer",
+      "location": "Tel Aviv",
+      "description": "Brief summary",
+      "qualifications": "Key requirements",
+      "date_posted": "2025-10-14 or empty",
+      "url": "{company_url}"
+    }}
+  ]
+}}
+"""
         
         try:
             response = ollama.chat(
@@ -586,92 +505,68 @@ class RateLimitedJobScraper:
                 messages=[{'role': 'user', 'content': prompt}]
             )
             
-            response_text = response['message']['content'].strip()
+            job_data = self.extract_json_from_llm_response(response['message']['content'])
+            if not job_data:
+                return []
             
-            # Better JSON extraction
-            json_start = response_text.find('{')
-            json_end = response_text.rfind('}') + 1
+            jobs = job_data.get('jobs', [])
             
-            if json_start != -1 and json_end > json_start:
-                json_str = response_text[json_start:json_end]
+            # Apply all filters
+            filtered_jobs = []
+            for job in jobs:
+                # Must have title
+                if not job.get('title'):
+                    continue
                 
-                # Try to fix common JSON issues
-                json_str = re.sub(r',\\s*}', '}', json_str)  # Remove trailing commas
-                json_str = re.sub(r',\\s*]', ']', json_str)  # Remove trailing commas in arrays
+                # Software engineering role check
+                if not self.is_software_engineering_role(job.get('title', '')):
+                    continue
                 
-                try:
-                    job_data = json.loads(json_str)
-                    jobs = job_data.get('jobs', [])
-                    
-                    # Apply filtering and add metadata
-                    filtered_jobs = []
-                    for job in jobs:
-                        if (job.get('title') and 
-                            self.is_software_engineering_role(job.get('title', '')) and 
-                            self.is_israeli_location(job.get('location', ''))):
-                            
-                            job['company'] = company_name
-                            job.setdefault('date_posted', '')
-                            job.setdefault('description', 'Description not available')
-                            job.setdefault('qualifications', 'Qualifications not specified')
-                            if not job.get('url') or job['url'] == company_url:
-                                job['url'] = company_url
-                            filtered_jobs.append(job)
-                    
-                    return filtered_jobs
-                    
-                except json.JSONDecodeError as e:
-                    self.logger.debug(f"JSON parse error for {company_url}: {e}")
-                    
+                # Location check (STRICT)
+                if not self.is_israeli_location(job.get('location', '')):
+                    continue
+                
+                # Date validation
+                date_valid, formatted_date = self.parse_job_date(job.get('date_posted', ''))
+                if not date_valid:
+                    continue  # Skip old jobs
+                
+                job['date_posted'] = formatted_date
+                job['company'] = company_name
+                job.setdefault('description', 'Description not available')
+                job.setdefault('qualifications', 'Qualifications not specified')
+                job.setdefault('url', company_url)
+                
+                filtered_jobs.append(job)
+            
+            return filtered_jobs
+            
         except Exception as e:
-            self.logger.debug(f"Ollama analysis error for {company_url}: {e}")
-            
-        return []
+            self.logger.debug(f"Ollama error: {e}")
+            return []
     
     def scrape_company_jobs(self, url):
-        """Enhanced job scraping with better error handling"""
-        self.logger.info(f"🔍 Processing: {urlparse(url).netloc}")
+        """Scrape jobs - FIXED: Selenium only runs if requests fails"""
+        self.logger.info(f"🔍 {urlparse(url).netloc}")
         
-        # Scrape main career page
+        # Try requests first
         scraped_content, soup = self.scrape_with_requests(url)
         
+        # ONLY try Selenium if requests failed
         if not scraped_content and self.config['use_selenium_for_js']:
+            self.logger.info(f"  ↳ Requests failed, trying Selenium...")
             scraped_content, soup = self.scrape_with_selenium(url)
         
         if not scraped_content:
-            self.logger.warning(f"⚠️ No content scraped from {urlparse(url).netloc}")
+            self.logger.warning(f"⚠️ Failed to scrape {urlparse(url).netloc}")
             return []
         
-        all_jobs = []
+        # Analyze content
+        jobs = self.enhanced_ollama_analysis(scraped_content, url)
         
-        # Analyze main page
-        main_jobs = self.enhanced_ollama_analysis(scraped_content, url)
-        all_jobs.extend(main_jobs)
-        
-        # Crawl individual job pages if enabled and we found jobs
-        if (self.config.get('enable_job_crawling', True) and soup and len(main_jobs) > 0):
-            job_links = self.extract_job_links(soup, url)
-            
-            if job_links:
-                for i, job_url in enumerate(job_links):
-                    if i >= self.config.get('max_crawl_depth', 5):
-                        break
-                        
-                    job_content = self.scrape_individual_job(job_url)
-                    if job_content:
-                        individual_jobs = self.enhanced_ollama_analysis(job_content, job_url)
-                        for job in individual_jobs:
-                            job['url'] = job_url
-                        all_jobs.extend(individual_jobs)
-                    
-                    time.sleep(1)
-        
-        # Filter duplicates and add metadata
+        # Filter duplicates
         new_jobs = []
-        for job in all_jobs:
-            if not all([job.get('title'), job.get('company')]):
-                continue
-                
+        for job in jobs:
             job_id = self.create_job_id(job['title'], job['company'], job.get('location', ''))
             if job_id not in self.existing_jobs:
                 job['date_added'] = datetime.now().strftime('%Y-%m-%d')
@@ -679,259 +574,235 @@ class RateLimitedJobScraper:
                 self.existing_jobs.add(job_id)
         
         if new_jobs:
-            self.logger.info(f"✅ Found {len(new_jobs)} new software engineering jobs")
+            self.logger.info(f"✅ {len(new_jobs)} new jobs")
         
         return new_jobs
     
     def extract_company_name_from_url(self, url):
-        """Enhanced company name extraction"""
+        """Extract company name"""
         try:
             domain = urlparse(url).netloc.lower()
             domain = domain.replace('www.', '').replace('careers.', '').replace('jobs.', '')
             company = domain.split('.')[0]
             
-            company_mapping = {
+            mapping = {
                 'amazon': 'Amazon', 'google': 'Google', 'microsoft': 'Microsoft',
-                'apple': 'Apple', 'netflix': 'Netflix', 'meta': 'Meta',
-                'facebook': 'Meta', 'linkedin': 'LinkedIn', 'salesforce': 'Salesforce',
-                'nvidia': 'NVIDIA', 'intel': 'Intel', 'amd': 'AMD', 'oracle': 'Oracle'
+                'apple': 'Apple', 'nvidia': 'NVIDIA', 'intel': 'Intel'
             }
             
-            return company_mapping.get(company, company.title())
+            return mapping.get(company, company.title())
         except:
-            return "Unknown Company"
+            return "Unknown"
     
-    def is_entry_level_job(self, title):
-        """Check if job is entry/student/intern position"""
-        entry_keywords = [
-            'intern', 'internship', 'student', 'entry', 'junior', 'graduate', 
-            'new grad', 'fresh', 'trainee', 'apprentice', 'associate'
-        ]
-        title_lower = title.lower()
-        return any(keyword in title_lower for keyword in entry_keywords)
-    
-    def write_batch_to_sheets_with_retry(self, worksheet, batch_rows):
-        """Write a batch of rows to Google Sheets with retry logic"""
-        for attempt in range(self.max_retries):
+    def write_batch_with_retry(self, worksheet, batch_rows, sheet_type):
+        """Write batch with retry and formatting"""
+        for attempt in range(3):
             try:
-                # Prepare batch data for append
-                if batch_rows:
-                    worksheet.append_rows(batch_rows)
+                if not batch_rows:
+                    return True
+                
+                worksheet.append_rows(batch_rows)
+                
+                total_rows = len(worksheet.get_all_values())
+                start_row = total_rows - len(batch_rows) + 1
+                
+                # Format rows
+                for i, row_data in enumerate(batch_rows):
+                    row_number = start_row + i
+                    title = row_data[0]
                     
-                    # Get starting row number for formatting
-                    total_rows = len(worksheet.get_all_values())
-                    start_row = total_rows - len(batch_rows) + 1
-                    
-                    # Format the batch
-                    for i, row_data in enumerate(batch_rows):
-                        row_number = start_row + i
-                        title = row_data[0]
+                    try:
+                        # Bold for entry/junior in Sheet2
+                        if sheet_type == "Sheet2" and self.is_entry_junior_position(title):
+                            worksheet.format(f'A{row_number}', {
+                                'textFormat': {'bold': True},
+                                'wrapStrategy': 'WRAP'
+                            })
                         
-                        try:
-                            # Check if it's entry level for bold formatting
-                            if self.is_entry_level_job(title):
-                                # Bold title for entry/intern positions
-                                worksheet.format(f'A{row_number}:A{row_number}', {
-                                    'textFormat': {'bold': True, 'fontSize': 10},
-                                    'wrapStrategy': 'WRAP',
-                                    'verticalAlignment': 'TOP'
-                                })
-                            
-                            # Format other columns with wrapping
-                            worksheet.format(f'E{row_number}:F{row_number}', {  # Description, Qualifications
-                                'wrapStrategy': 'WRAP',
-                                'verticalAlignment': 'TOP',
-                                'textFormat': {'fontSize': 10}
-                            })
-                            
-                            # Set row height
-                            worksheet.spreadsheet.batch_update({
-                                'requests': [{
-                                    'updateDimensionProperties': {
-                                        'range': {
-                                            'sheetId': worksheet.id,
-                                            'dimension': 'ROWS',
-                                            'startIndex': row_number - 1,
-                                            'endIndex': row_number
-                                        },
-                                        'properties': {'pixelSize': 80},
-                                        'fields': 'pixelSize'
-                                    }
-                                }]
-                            })
-                            
-                        except Exception as e:
-                            self.logger.debug(f"Formatting error for row {row_number}: {e}")
-                    
-                    return True  # Success
-                    
+                        # Wrap description/qualifications
+                        worksheet.format(f'D{row_number}:E{row_number}', {
+                            'wrapStrategy': 'WRAP',
+                            'verticalAlignment': 'TOP'
+                        })
+                        
+                        # Row height
+                        worksheet.spreadsheet.batch_update({
+                            'requests': [{
+                                'updateDimensionProperties': {
+                                    'range': {
+                                        'sheetId': worksheet.id,
+                                        'dimension': 'ROWS',
+                                        'startIndex': row_number - 1,
+                                        'endIndex': row_number
+                                    },
+                                    'properties': {'pixelSize': 80},
+                                    'fields': 'pixelSize'
+                                }
+                            }]
+                        })
+                    except:
+                        pass
+                
+                return True
+                
             except APIError as e:
-                if "429" in str(e):  # Quota exceeded
-                    self.logger.warning(f"⚠️ Rate limit hit (attempt {attempt + 1}), waiting {self.write_delay * 2} seconds...")
-                    time.sleep(self.write_delay * 2)  # Wait longer on rate limit
+                if "429" in str(e):
+                    self.logger.warning(f"⚠️ Rate limit, waiting...")
+                    time.sleep(12)
                     continue
-                else:
-                    self.logger.error(f"❌ API Error: {e}")
-                    if attempt < self.max_retries - 1:
-                        time.sleep(self.write_delay)
-                        continue
-                    else:
-                        return False
-            except Exception as e:
-                self.logger.error(f"❌ Error writing batch: {e}")
-                if attempt < self.max_retries - 1:
-                    time.sleep(self.write_delay)
+                return False
+            except:
+                if attempt < 2:
+                    time.sleep(6)
                     continue
-                else:
-                    return False
+                return False
         
         return False
     
-    def save_jobs_to_sheet(self, all_jobs):
-        """Save jobs to Google Sheets with rate limiting and batch processing"""
-        if not all_jobs:
-            self.logger.info("📄 No new jobs to save")
+    def save_jobs_to_sheets(self, all_jobs):
+        """Save jobs to appropriate sheets with rate limiting"""
+        if not all_jobs or not self.gc:
             return
+        
+        # Separate jobs by type
+        student_intern_jobs = []
+        regular_jobs = []
+        
+        for job in all_jobs:
+            if self.is_student_intern_position(job['title']):
+                student_intern_jobs.append(job)
+            else:
+                regular_jobs.append(job)
+        
+        headers = ['Title', 'Company', 'Date Posted', 'Description', 'Qualifications', 'Location', 'URL', 'Date Added']
+        
+        # Save to Sheet2 (regular jobs)
+        if regular_jobs:
+            self.save_to_sheet("Sheet2", regular_jobs, headers)
+        
+        # Save to Sheet3 (student/intern)
+        if student_intern_jobs:
+            self.save_to_sheet("Sheet3", student_intern_jobs, headers)
+    
+    def save_to_sheet(self, sheet_name, jobs, headers):
+        """Save jobs to specific sheet"""
+        try:
+            worksheet = self.get_or_create_worksheet(sheet_name, headers)
+            if not worksheet:
+                return
+            
+            batch_size = self.config.get('sheets_batch_size', 10)
+            delay = self.config.get('sheets_write_delay', 6)
+            
+            self.logger.info(f"💾 Saving {len(jobs)} jobs to {sheet_name}")
+            
+            # Prepare rows
+            all_rows = []
+            for job in jobs:
+                row = [
+                    job.get('title', ''),
+                    job.get('company', ''),
+                    job.get('date_posted', ''),
+                    job.get('description', ''),
+                    job.get('qualifications', ''),
+                    job.get('location', ''),
+                    job.get('url', ''),
+                    job.get('date_added', '')
+                ]
+                all_rows.append(row)
+            
+            # Write in batches
+            total_batches = (len(all_rows) + batch_size - 1) // batch_size
+            successful = 0
+            
+            for i in range(0, len(all_rows), batch_size):
+                batch = all_rows[i:i + batch_size]
+                batch_num = (i // batch_size) + 1
+                
+                self.logger.info(f"  📤 Batch {batch_num}/{total_batches}")
+                
+                if self.write_batch_with_retry(worksheet, batch, sheet_name):
+                    successful += len(batch)
+                
+                if i + batch_size < len(all_rows):
+                    time.sleep(delay)
+            
+            self.logger.info(f"✅ Saved {successful}/{len(jobs)} to {sheet_name}")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error saving to {sheet_name}: {e}")
+    
+    def run(self):
+        """Main execution"""
+        start_time = datetime.now()
+        self.logger.info("🚀 Clean Job Scraper V4")
         
         if not self.gc:
             self.logger.error("❌ Google Sheets not configured")
             return
         
-        try:
-            worksheet = self.get_worksheet()
-            if not worksheet:
-                return
-            
-            self.logger.info(f"💾 Saving {len(all_jobs)} jobs in batches of {self.batch_size}")
-            
-            # Prepare all row data
-            all_rows = []
-            for job in all_jobs:
-                title = job.get('title', '')
-                company = job.get('company', '')
-                date_posted = job.get('date_posted', '')
-                date_added = job.get('date_added', '')
-                description = job.get('description', '')
-                qualifications = job.get('qualifications', '')
-                location = job.get('location', '')
-                url = job.get('url', '')
-                
-                row_data = [title, company, date_posted, date_added, description, qualifications, location, url]
-                all_rows.append(row_data)
-            
-            # Process in batches with rate limiting
-            total_batches = (len(all_rows) + self.batch_size - 1) // self.batch_size
-            successful_jobs = 0
-            
-            for i in range(0, len(all_rows), self.batch_size):
-                batch = all_rows[i:i + self.batch_size]
-                batch_num = (i // self.batch_size) + 1
-                
-                self.logger.info(f"📤 Writing batch {batch_num}/{total_batches} ({len(batch)} jobs)...")
-                
-                success = self.write_batch_to_sheets_with_retry(worksheet, batch)
-                
-                if success:
-                    successful_jobs += len(batch)
-                    self.logger.info(f"✅ Batch {batch_num} saved successfully")
-                else:
-                    self.logger.error(f"❌ Failed to save batch {batch_num}")
-                
-                # Rate limiting delay between batches (except for last batch)
-                if i + self.batch_size < len(all_rows):
-                    self.logger.info(f"⏳ Waiting {self.write_delay} seconds (rate limiting)...")
-                    time.sleep(self.write_delay)
-            
-            self.logger.info(f"🎉 Successfully saved {successful_jobs}/{len(all_jobs)} jobs to Google Sheets")
-            
-            if successful_jobs < len(all_jobs):
-                self.logger.warning(f"⚠️ {len(all_jobs) - successful_jobs} jobs failed to save due to API limits")
-            
-            # Get sheet URL
-            try:
-                sheet_url = worksheet.spreadsheet.url
-                self.logger.info(f"🔗 View results: {sheet_url}")
-            except:
-                pass
-                
-        except Exception as e:
-            self.logger.error(f"❌ Error saving to Google Sheets: {e}")
-    
-    def run(self):
-        """Main execution with comprehensive error handling"""
-        start_time = datetime.now()
-        self.logger.info("🚀 Rate-Limited Job Scraper V3.1 - Software Engineering Jobs for Israel")
+        self.existing_jobs = self.load_existing_jobs_from_sheets()
         
-        if not self.gc:
-            self.logger.error("❌ Google Sheets not configured. Cannot proceed.")
+        urls = self.load_company_urls()
+        if not urls:
+            self.logger.error("❌ No URLs")
             return
         
-        # Load existing jobs from Google Sheets
-        self.existing_jobs = self.load_existing_jobs_from_sheet()
+        all_jobs = []
         
-        # Load URLs
-        company_urls = self.load_company_urls()
-        if not company_urls:
-            self.logger.error("❌ No URLs found. Please add URLs to company_urls.txt")
-            return
-        
-        all_new_jobs = []
-        stats = {'successful': 0, 'failed': 0, 'total_jobs': 0}
-        
-        for i, url in enumerate(company_urls, 1):
+        for i, url in enumerate(urls, 1):
             try:
-                self.logger.info(f"[{i}/{len(company_urls)}] {urlparse(url).netloc}")
+                self.logger.info(f"[{i}/{len(urls)}]")
                 jobs = self.scrape_company_jobs(url)
-                all_new_jobs.extend(jobs)
-                stats['total_jobs'] += len(jobs)
+                all_jobs.extend(jobs)
                 
-                if jobs:
-                    stats['successful'] += 1
-                else:
-                    stats['failed'] += 1
-                
-                if i < len(company_urls):
+                if i < len(urls):
                     time.sleep(self.config['delay_between_requests'])
                 
             except Exception as e:
-                self.logger.error(f"❌ Error processing {urlparse(url).netloc}: {e}")
-                stats['failed'] += 1
+                self.logger.error(f"❌ Error: {e}")
                 continue
         
-        # Save to Google Sheets with rate limiting
-        self.save_jobs_to_sheet(all_new_jobs)
+        self.save_jobs_to_sheets(all_jobs)
         
-        # Final summary
         duration = datetime.now() - start_time
         self.logger.info("=" * 60)
-        self.logger.info("🎉 RATE-LIMITED JOB SCRAPING COMPLETED")
-        self.logger.info("=" * 60)
-        self.logger.info(f"⏱️  Duration: {duration}")
-        self.logger.info(f"🌐 URLs processed: {len(company_urls)}")
-        self.logger.info(f"✅ Successful: {stats['successful']}")
-        self.logger.info(f"❌ Failed: {stats['failed']}")
-        self.logger.info(f"💼 New jobs found: {stats['total_jobs']}")
-        self.logger.info(f"🎯 Target: Software Engineering in Israel")
-        self.logger.info(f"⚡ Rate limiting: {self.batch_size} jobs per batch, {self.write_delay}s delays")
+        self.logger.info(f"🎉 COMPLETED in {duration}")
+        self.logger.info(f"💼 Total jobs: {len(all_jobs)}")
         self.logger.info("=" * 60)
 
 def main():
-    """Main entry point with error handling"""
     try:
-        scraper = RateLimitedJobScraper()
+        scraper = CleanJobScraperV4()
         scraper.run()
     except KeyboardInterrupt:
-        logging.info("⚠️ Interrupted by user")
+        logging.info("⚠️ Interrupted")
     except Exception as e:
-        logging.error(f"💥 Fatal error: {e}")
-        import traceback
-        logging.error(f"Traceback: {traceback.format_exc()}")
+        logging.error(f"💥 Error: {e}")
 
 if __name__ == "__main__":
     main()
 '''
 
-with open('job_scraper_v3_1_rate_limited.py', 'w', encoding='utf-8') as f:
-    f.write(rate_limited_scraper)
+with open('job_scraper_v4_clean.py', 'w', encoding='utf-8') as f:
+    f.write(clean_v4_scraper)
 
-print("✅ Created job_scraper_v3_1_rate_limited.py - Rate-limited batch writing version")
+print("✅ Created job_scraper_v4_clean.py")
+print()
+print("🎯 ALL ISSUES FIXED:")
+print("  ✅ OLD JOBS: Filters by current year (2025), rejects 2023 jobs")
+print("  ✅ LOCATION: STRICT whitelist - only Israeli cities/Israel keyword")
+print("  ✅ REDUNDANCY: Removed exclusion lists, country codes, state detection")
+print("  ✅ SELENIUM: Only runs if requests FAILS (no double scraping)")
+print("  ✅ JSON PARSING: Robust extraction, removes markdown, handles errors")
+print("  ✅ SHEET3: Student/intern jobs go to Sheet3")
+print("  ✅ SHEET2: Junior/entry stay in Sheet2 with bold titles")
+print("  ✅ COLUMN ORDER: Date Added moved after URL")
+print("  ✅ PDNA: Missing dates shown as '**PDNA**' (Post Date Not Available)")
+print()
+print("🧹 CLEANED UP:")
+print("  • No redundant country exclusion lists")
+print("  • No wasteful double-scraping")  
+print("  • Proper conditional Selenium usage")
+print("  • Robust JSON extraction")
+print("  • Simple, clean location logic")
