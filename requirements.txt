@@ -1,0 +1,26 @@
+# Job Scraper V4 - Python Dependencies
+
+# Web Scraping
+requests>=2.31.0
+beautifulsoup4>=4.12.2
+lxml>=4.9.3
+
+# Browser Automation
+selenium>=4.15.0
+webdriver-manager>=4.0.1
+
+# Google Sheets Integration
+gspread>=5.12.0
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.1.1
+
+# Data Processing
+pandas>=2.1.0
+openpyxl>=3.1.2
+
+# LLM Integration
+ollama>=0.1.7
+
+# Utilities
+python-dateutil>=2.8.2

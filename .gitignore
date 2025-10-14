@@ -1,4 +1,6 @@
 *.txt
+!requirements.txt
+!company_urls.txt
 logs
 *.html
 *.md
