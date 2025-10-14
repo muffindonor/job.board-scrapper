@@ -324,10 +324,23 @@ class CleanJobScraperV4:
         return True, "**PDNA**"
 
     def is_student_intern_position(self, title: str) -> bool:
-        """Check if position is specifically for students/interns (Sheet3)"""
+        """Check if position is specifically for students/interns (Sheet3) - FIXED"""
+        import re
         title_lower = title.lower()
-        student_intern_keywords = ['intern', 'internship', 'student', 'trainee', 'apprentice']
-        return any(keyword in title_lower for keyword in student_intern_keywords)
+        
+        # Use word boundaries to match whole words only
+        if re.search(r'\bintern\b', title_lower):      # "intern" as complete word
+            return True
+        if re.search(r'\binternship\b', title_lower):  # "internship" as complete word
+            return True
+        if re.search(r'\bstudent\b', title_lower):     # "student" as complete word
+            return True
+        if re.search(r'\btrainee\b', title_lower):     # "trainee" as complete word
+            return True
+        if re.search(r'\bapprentice\b', title_lower):  # "apprentice" as complete word
+            return True
+    
+        return False    
 
     def is_entry_junior_position(self, title: str) -> bool:
         """Check if position is entry/junior level (Sheet2, bolded)"""
