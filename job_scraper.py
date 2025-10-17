@@ -26,9 +26,9 @@ import ollama
 from typing import List, Dict, Optional, Set, Tuple
 import sys
 
-class JobScraperV42:
+class JobScraperV43Safe:
     def __init__(self, config_file='config.json'):
-        """Job scraper V4.2 with FIXED column ordering and auto-sorting"""
+        """Job scraper V4.3 - SAFE, quota-friendly, data-preserving version"""
         self.config = self.load_config(config_file)
         self.setup_logging()
         self.existing_jobs = set()
@@ -37,7 +37,7 @@ class JobScraperV42:
         self.setup_filters()
         self.current_year = datetime.now().year
 
-        # CRITICAL: Check Ollama connection at startup
+        # Ollama check
         if not self.startup_ollama_check():
             self.logger.error("💥 STOPPING: Cannot proceed without Ollama")
             sys.exit(1)
@@ -53,17 +53,14 @@ class JobScraperV42:
                 model=self.config['ollama_model'],
                 messages=[{'role': 'user', 'content': 'test'}]
             )
-            self.logger.info(f"✅ Ollama ({self.config['ollama_model']}) connection successful")
+            self.logger.info(f"✅ Ollama ({self.config['ollama_model']}) ready")
             return True
         except Exception as e:
             self.logger.error("❌ OLLAMA CONNECTION FAILED!")
             self.logger.error(f"Error: {e}")
-            self.logger.error("")
             self.logger.error("🚑 SOLUTION:")
-            self.logger.error("  1. Start Ollama service: ollama serve")
+            self.logger.error("  1. Start Ollama: ollama serve")
             self.logger.error(f"  2. Pull model: ollama pull {self.config['ollama_model']}")
-            self.logger.error(f"  3. Test: ollama run {self.config['ollama_model']}")
-            self.logger.error("  4. Then run this program again")
             return False
 
     def setup_google_sheets(self):
@@ -81,97 +78,34 @@ class JobScraperV42:
             self.logger.error(f"❌ Google Sheets setup failed: {e}")
             self.gc = None
 
-    def get_or_create_worksheet(self, sheet_name: str, headers: List[str]):
-        """Get or create a worksheet with STANDARDIZED headers"""
+    def get_or_create_worksheet_safe(self, sheet_name: str):
+        """SAFE worksheet access - NEVER clears existing data"""
         try:
             spreadsheet = self.gc.open(self.sheet_name)
 
             try:
                 worksheet = spreadsheet.worksheet(sheet_name)
-                # Update headers to ensure consistency across all sheets
-                current_headers = worksheet.row_values(1) if worksheet.row_count > 0 else []
-                if current_headers != headers:
-                    worksheet.clear()
-                    worksheet.append_row(headers)
-                    self.setup_sheet_formatting(worksheet)
-                    self.logger.info(f"✅ Updated {sheet_name} headers for consistency")
+                self.logger.info(f"✅ Found existing {sheet_name}")
+                return worksheet
             except gspread.exceptions.WorksheetNotFound:
+                # Only create if doesn't exist - NEVER modify existing
                 worksheet = spreadsheet.add_worksheet(sheet_name, 1000, 10)
+                headers = ['Title', 'Company', 'Date Posted', 'Description', 'Qualifications', 'Location', 'URL', 'Date Added']
                 worksheet.append_row(headers)
-                self.setup_sheet_formatting(worksheet)
-                self.logger.info(f"✅ Created {sheet_name} with standardized headers")
+                self.logger.info(f"✅ Created new {sheet_name}")
+                return worksheet
 
-            return worksheet
         except Exception as e:
             self.logger.error(f"❌ Error accessing {sheet_name}: {e}")
             return None
-
-    def setup_sheet_formatting(self, worksheet):
-        """Set up Google Sheet formatting with proper column widths"""
-        try:
-            # Column width settings - FIXED for correct order
-            column_widths = [
-                (0, 1, 300),   # Title
-                (1, 2, 150),   # Company
-                (2, 3, 100),   # Date Posted
-                (3, 4, 400),   # Description
-                (4, 5, 400),   # Qualifications
-                (5, 6, 120),   # Location
-                (6, 7, 200),   # URL
-                (7, 8, 130)    # Date Added (wider for timestamp)
-            ]
-
-            requests = []
-            for start_idx, end_idx, width in column_widths:
-                requests.append({
-                    'updateDimensionProperties': {
-                        'range': {
-                            'sheetId': worksheet.id,
-                            'dimension': 'COLUMNS',
-                            'startIndex': start_idx,
-                            'endIndex': end_idx
-                        },
-                        'properties': {'pixelSize': width},
-                        'fields': 'pixelSize'
-                    }
-                })
-
-            worksheet.spreadsheet.batch_update({'requests': requests})
-
-            # Format header row
-            worksheet.format('A1:H1', {
-                'backgroundColor': {'red': 0.2, 'green': 0.6, 'blue': 0.9},
-                'textFormat': {'bold': True, 'fontSize': 12, 'foregroundColor': {'red': 1, 'green': 1, 'blue': 1}},
-                'horizontalAlignment': 'CENTER',
-                'verticalAlignment': 'MIDDLE'
-            })
-
-            # Freeze header row
-            worksheet.spreadsheet.batch_update({
-                'requests': [{
-                    'updateSheetProperties': {
-                        'properties': {
-                            'sheetId': worksheet.id,
-                            'gridProperties': {'frozenRowCount': 1}
-                        },
-                        'fields': 'gridProperties.frozenRowCount'
-                    }
-                }]
-            })
-
-        except Exception as e:
-            self.logger.error(f"❌ Sheet formatting error: {e}")
 
     def load_existing_jobs_from_sheets(self):
         """Load existing jobs from all sheets"""
         existing_jobs = set()
 
-        # STANDARDIZED headers for ALL sheets
-        headers = ['Title', 'Company', 'Date Posted', 'Description', 'Qualifications', 'Location', 'URL', 'Date Added']
-
         for sheet_name in ["Sheet2", "Sheet3", "Sheet4"]:
             try:
-                worksheet = self.get_or_create_worksheet(sheet_name, headers)
+                worksheet = self.get_or_create_worksheet_safe(sheet_name)
                 if not worksheet:
                     continue
 
@@ -180,8 +114,11 @@ class JobScraperV42:
                     continue
 
                 for row in all_values[1:]:
-                    if len(row) >= 7:
-                        title, company, _, _, _, location, _ = row[:7]
+                    if len(row) >= 2:  # At least title and company
+                        title = row[0] if len(row) > 0 else ''
+                        company = row[1] if len(row) > 1 else ''
+                        location = row[5] if len(row) > 5 else ''  # Location might be in different position
+
                         if title and company:
                             job_id = self.create_job_id(title, company, location)
                             existing_jobs.add(job_id)
@@ -189,7 +126,7 @@ class JobScraperV42:
             except Exception as e:
                 self.logger.error(f"❌ Error loading jobs from {sheet_name}: {e}")
 
-        self.logger.info(f"📊 Loaded {len(existing_jobs)} existing jobs from Google Sheets")
+        self.logger.info(f"📊 Loaded {len(existing_jobs)} existing jobs")
         return existing_jobs
 
     def setup_filters(self):
@@ -246,8 +183,7 @@ class JobScraperV42:
             "enable_job_crawling": True,
             "sheets_batch_size": 10,
             "sheets_write_delay": 6,
-            "filter_by_current_year": True,
-            "auto_sort_sheets": True
+            "filter_by_current_year": True
         }
 
         if os.path.exists(config_file):
@@ -388,7 +324,7 @@ class JobScraperV42:
         elif self.is_entry_junior_position(title):
             return "Sheet3"
         else:
-            return "Sheet3"  # Regular jobs with entry
+            return "Sheet3"
 
     def create_silent_chrome_driver(self):
         """Create silent Chrome driver"""
@@ -539,8 +475,8 @@ Return ONLY this JSON:
       "title": "Software Engineer",
       "location": "Tel Aviv",
       "description": "Brief summary",
-      "qualifications": "Key requirements",
-      "date_posted": "2025-10-16 or empty",
+      "qualifications": "Key requirements", 
+      "date_posted": "2025-10-17 or empty",
       "url": "{company_url}"
     }}
   ]
@@ -608,7 +544,6 @@ Return ONLY this JSON:
         for job in jobs:
             job_id = self.create_job_id(job['title'], job['company'], job.get('location', ''))
             if job_id not in self.existing_jobs:
-                # FIXED: Use proper timestamp format
                 job['date_added'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 new_jobs.append(job)
                 self.existing_jobs.add(job_id)
@@ -634,85 +569,14 @@ Return ONLY this JSON:
         except:
             return "Unknown"
 
-    def sort_sheet_by_date_added(self, worksheet):
-        """Sort sheet by Date Added column (newest to oldest) - NEW FEATURE"""
-        if not self.config.get('auto_sort_sheets', True):
-            return
-
-        try:
-            all_data = worksheet.get_all_values()
-            if len(all_data) <= 1:
-                return
-
-            headers = all_data[0]
-            data_rows = all_data[1:]
-
-            # Sort by Date Added column (index 7) - newest first
-            sorted_rows = sorted(data_rows, 
-                               key=lambda x: x[7] if len(x) > 7 and x[7] else '1900-01-01 00:00:00', 
-                               reverse=True)
-
-            # Clear and rewrite with sorted data
-            worksheet.clear()
-            worksheet.append_row(headers)
-            if sorted_rows:
-                worksheet.append_rows(sorted_rows)
-
-            # Reapply formatting
-            self.setup_sheet_formatting(worksheet)
-
-        except Exception as e:
-            self.logger.error(f"❌ Error sorting sheet: {e}")
-
-    def write_batch_with_retry(self, worksheet, batch_rows, sheet_type):
-        """Write batch with retry and formatting"""
+    def write_batch_with_retry(self, worksheet, batch_rows):
+        """MINIMAL batch writing - quota-safe"""
         for attempt in range(3):
             try:
                 if not batch_rows:
                     return True
 
                 worksheet.append_rows(batch_rows)
-
-                total_rows = len(worksheet.get_all_values())
-                start_row = total_rows - len(batch_rows) + 1
-
-                # Format rows
-                for i, row_data in enumerate(batch_rows):
-                    row_number = start_row + i
-                    title = row_data[0]
-
-                    try:
-                        # Bold for entry/junior in Sheet3 only
-                        if sheet_type == "Sheet3" and self.is_entry_junior_position(title):
-                            worksheet.format(f'A{row_number}', {
-                                'textFormat': {'bold': True},
-                                'wrapStrategy': 'WRAP'
-                            })
-
-                        # Wrap description/qualifications  
-                        worksheet.format(f'D{row_number}:E{row_number}', {
-                            'wrapStrategy': 'WRAP',
-                            'verticalAlignment': 'TOP'
-                        })
-
-                        # Row height
-                        worksheet.spreadsheet.batch_update({
-                            'requests': [{
-                                'updateDimensionProperties': {
-                                    'range': {
-                                        'sheetId': worksheet.id,
-                                        'dimension': 'ROWS',
-                                        'startIndex': row_number - 1,
-                                        'endIndex': row_number
-                                    },
-                                    'properties': {'pixelSize': 80},
-                                    'fields': 'pixelSize'
-                                }
-                            }]
-                        })
-                    except:
-                        pass
-
                 return True
 
             except APIError as e:
@@ -730,7 +594,7 @@ Return ONLY this JSON:
         return False
 
     def save_jobs_to_sheets(self, all_jobs):
-        """Save jobs with FIXED column ordering and auto-sorting"""
+        """Save jobs with MINIMAL operations - quota-safe"""
         if not all_jobs or not self.gc:
             return
 
@@ -748,23 +612,20 @@ Return ONLY this JSON:
             elif sheet == "Sheet4":
                 sheet4_jobs.append(job)
 
-        # STANDARDIZED headers for ALL sheets
-        headers = ['Title', 'Company', 'Date Posted', 'Description', 'Qualifications', 'Location', 'URL', 'Date Added']
-
-        # Save to sheets
+        # Save to sheets with MINIMAL operations
         if sheet2_jobs:
-            self.save_to_sheet("Sheet2", sheet2_jobs, headers, "Student/Intern")
+            self.save_to_sheet_safe("Sheet2", sheet2_jobs, "Student/Intern")
 
         if sheet3_jobs:
-            self.save_to_sheet("Sheet3", sheet3_jobs, headers, "Entry/Regular")
+            self.save_to_sheet_safe("Sheet3", sheet3_jobs, "Entry/Regular")
 
         if sheet4_jobs:
-            self.save_to_sheet("Sheet4", sheet4_jobs, headers, "Senior")
+            self.save_to_sheet_safe("Sheet4", sheet4_jobs, "Senior")
 
-    def save_to_sheet(self, sheet_name, jobs, headers, category):
-        """Save jobs with CORRECT column order and auto-sorting"""
+    def save_to_sheet_safe(self, sheet_name, jobs, category):
+        """SAFE sheet saving - MINIMAL quota usage"""
         try:
-            worksheet = self.get_or_create_worksheet(sheet_name, headers)
+            worksheet = self.get_or_create_worksheet_safe(sheet_name)
             if not worksheet:
                 return
 
@@ -773,22 +634,22 @@ Return ONLY this JSON:
 
             self.logger.info(f"💾 Saving {len(jobs)} {category} jobs to {sheet_name}")
 
-            # FIXED: Prepare rows in CORRECT order matching headers exactly
+            # CORRECT column order - no fancy formatting
             all_rows = []
             for job in jobs:
                 row = [
-                    job.get('title', ''),                           # Position 0: Title
-                    job.get('company', ''),                         # Position 1: Company  
-                    job.get('date_posted', ''),                     # Position 2: Date Posted
-                    job.get('description', ''),                     # Position 3: Description
-                    job.get('qualifications', ''),                  # Position 4: Qualifications
-                    job.get('location', ''),                        # Position 5: Location
-                    job.get('url', ''),                            # Position 6: URL
-                    job.get('date_added', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))  # Position 7: Date Added with TIME
+                    job.get('title', ''),                           # Title
+                    job.get('company', ''),                         # Company  
+                    job.get('date_posted', ''),                     # Date Posted
+                    job.get('description', ''),                     # Description
+                    job.get('qualifications', ''),                  # Qualifications
+                    job.get('location', ''),                        # Location
+                    job.get('url', ''),                            # URL
+                    job.get('date_added', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))  # Date Added
                 ]
                 all_rows.append(row)
 
-            # Write in batches
+            # Write in batches - MINIMAL operations
             total_batches = (len(all_rows) + batch_size - 1) // batch_size
             successful = 0
 
@@ -798,25 +659,21 @@ Return ONLY this JSON:
 
                 self.logger.info(f"  📤 Batch {batch_num}/{total_batches}")
 
-                if self.write_batch_with_retry(worksheet, batch, sheet_name):
+                if self.write_batch_with_retry(worksheet, batch):
                     successful += len(batch)
 
                 if i + batch_size < len(all_rows):
                     time.sleep(delay)
 
-            # AUTO-SORT by Date Added (newest first) - NEW FEATURE
-            self.logger.info(f"  🔄 Auto-sorting {sheet_name} by newest first...")
-            self.sort_sheet_by_date_added(worksheet)
-
-            self.logger.info(f"✅ Saved {successful}/{len(jobs)} to {sheet_name} (auto-sorted)")
+            self.logger.info(f"✅ Saved {successful}/{len(jobs)} to {sheet_name}")
 
         except Exception as e:
             self.logger.error(f"❌ Error saving to {sheet_name}: {e}")
 
     def run(self):
-        """Main execution"""
+        """Main execution - SAFE version"""
         start_time = datetime.now()
-        self.logger.info("🚀 Job Scraper V4.2 - FIXED Column Ordering + Auto-Sort")
+        self.logger.info("🚀 Job Scraper V4.3 - SAFE & QUOTA-FRIENDLY")
 
         if not self.gc:
             self.logger.error("❌ Google Sheets not configured")
@@ -829,12 +686,11 @@ Return ONLY this JSON:
             self.logger.error("❌ No URLs")
             return
 
-        self.logger.info(f"📊 FIXED SHEET STRUCTURE:")
-        self.logger.info(f"  • All sheets: Title | Company | Date Posted | Description | Qualifications | Location | URL | Date Added")
-        self.logger.info(f"  • Sheet2: Student/Intern positions")
-        self.logger.info(f"  • Sheet3: Entry/Junior + Regular positions (bold entry)")
-        self.logger.info(f"  • Sheet4: Senior positions")
-        self.logger.info(f"  • Auto-sort: Newest jobs first by Date Added timestamp")
+        self.logger.info("🛡️ SAFETY FEATURES:")
+        self.logger.info("  • NEVER clears existing data")
+        self.logger.info("  • MINIMAL API operations") 
+        self.logger.info("  • CORRECT column ordering")
+        self.logger.info("  • Quota-friendly batch writing")
 
         all_jobs = []
 
@@ -855,15 +711,14 @@ Return ONLY this JSON:
 
         duration = datetime.now() - start_time
         self.logger.info("=" * 60)
-        self.logger.info(f"🎉 COMPLETED in {duration}")
+        self.logger.info(f"🎉 COMPLETED SAFELY in {duration}")
         self.logger.info(f"💼 Total jobs: {len(all_jobs)}")
-        self.logger.info(f"✅ Column ordering FIXED")
-        self.logger.info(f"🔄 Auto-sorting enabled")
+        self.logger.info(f"🛡️ Data preserved, quota respected")
         self.logger.info("=" * 60)
 
 def main():
     try:
-        scraper = JobScraperV42()
+        scraper = JobScraperV43Safe()
         scraper.run()
     except KeyboardInterrupt:
         logging.info("⚠️ Interrupted")
