@@ -69,7 +69,12 @@ def setup_logging(debug: bool = False) -> logging.Logger:
             logging.StreamHandler(),
         ],
     )
-    for noisy in ["urllib3", "selenium", "webdriver_manager", "requests", "gspread", "undetected_chromedriver"]:
+    for noisy in [
+        "urllib3", "selenium", "webdriver_manager",
+        "webdriver_manager.core", "webdriver_manager.core.driver_cache",
+        "webdriver_manager.core.manager", "webdriver_manager.core.download_manager",
+        "webdriver_manager.drivers", "requests", "gspread", "undetected_chromedriver",
+    ]:
         logging.getLogger(noisy).setLevel(logging.ERROR)
 
     return logging.getLogger("job_scraper")
@@ -109,6 +114,23 @@ CLOUDFLARE_MARKERS = [
 
 # LinkedIn blocks headless scrapers categorically - skip silently
 BLOCKED_DOMAINS = ["linkedin.com"]
+
+# Domains whose raw HTML is a JS shell -- job content is injected after load.
+# These skip straight to Selenium, bypassing the requests tier entirely.
+JS_RENDERED_DOMAINS = [
+    "myworkdayjobs.com",    # Workday (NVIDIA, Broadcom, Cadence, etc.)
+    "phenompeople.com",     # Phenom CMS (MSD/Merck career sites)
+    "greenhouse.io",        # Greenhouse ATS
+    "lever.co",             # Lever ATS
+    "smartrecruiters.com",  # SmartRecruiters
+    "taleo.net",            # Oracle Taleo
+    "oraclecloud.com",      # Oracle HCM
+    "icims.com",            # iCIMS
+    "jobvite.com",          # Jobvite
+    "successfactors.com",   # SAP SuccessFactors
+    "eightfold.ai",         # Eightfold AI (AmEx, etc.)
+    "comeet.com",           # Comeet (common in Israeli companies)
+]
 
 # Sheet tab names
 TAB_STUDENT = "Student_Jobs"
@@ -283,17 +305,72 @@ def _build_chrome_options() -> Options:
     return opts
 
 
+# Single JS call checking all known ATS job content selectors at once.
+# Returns innerText of first matching element with >200 chars, or empty string.
+_JOB_SELECTORS_JS = """
+(function() {
+    var s = [
+        '[data-automation-id=\"jobPostingDescription\"]',
+        '[data-automation-id=\"job-posting-description\"]',
+        '.wd-text',
+        '.jdp-description-jobDescription',
+        '.jd-info-jobDescription',
+        '[class*=\"jobDescription\"]',
+        '[class*=\"job-description\"]',
+        '#content .job-post',
+        '.job-post-content',
+        '.posting-description',
+        '.content-wrapper .section-wrapper',
+        '.co-position-description',
+        '.job-description',
+        '#job-description',
+        '#jobDescription',
+        '[itemprop=\"description\"]',
+        'article.job'
+    ];
+    for (var i = 0; i < s.length; i++) {
+        var el = document.querySelector(s[i]);
+        if (el && el.innerText && el.innerText.trim().length > 200) {
+            return el.innerText.trim();
+        }
+    }
+    return '';
+})();
+"""
+
+
 def _smart_wait(driver, log: logging.Logger) -> int:
-    """Poll body innerText until stable or timeout. Returns final char count."""
+    """
+    Poll every JS_SMART_WAIT_POLL seconds for two signals:
+
+    Signal 1 -- Known job element appeared (fast path):
+      Fires a single JS call checking all known ATS job content selectors.
+      Exits immediately when any selector yields >200 chars. Handles Workday,
+      Greenhouse, Lever, Phenom, Oracle HCM, Comeet and generic patterns.
+
+    Signal 2 -- Body text volume stable (fallback):
+      For sites not covered by known selectors, waits until body.innerText
+      reaches MIN_CONTENT chars and hasn't grown for JS_STABLE_ROUNDS polls.
+
+    Returns final char count.
+    """
     elapsed = last_len = stable = 0
     while elapsed < JS_SMART_WAIT_MAX:
         time.sleep(JS_SMART_WAIT_POLL)
         elapsed += JS_SMART_WAIT_POLL
         try:
+            # Signal 1: known job element check (one JS round-trip)
+            job_text = driver.execute_script(_JOB_SELECTORS_JS)
+            if job_text and len(job_text) > 200:
+                log.debug("[smart-wait] Job element detected after %.0fs (%d chars)", elapsed, len(job_text))
+                return len(job_text)
+
+            # Signal 2: body text volume + stability
             body = driver.execute_script("return document.body ? document.body.innerText : '';")
             cur = len(body or "")
         except Exception:
             cur = 0
+
         log.debug("[smart-wait] %.0fs | %d chars | stable %d/%d", elapsed, cur, stable, JS_STABLE_ROUNDS)
         if cur >= MIN_CONTENT:
             stable = stable + 1 if cur == last_len else 0
@@ -315,6 +392,29 @@ def _scroll_page(driver):
         driver.execute_script("window.scrollTo(0, 0);")
     except Exception:
         pass
+
+
+def _is_js_rendered(url: str) -> bool:
+    """Return True if URL belongs to a known JS-rendered ATS platform."""
+    url_lower = url.lower()
+    return any(domain in url_lower for domain in JS_RENDERED_DOMAINS)
+
+
+def _is_shell_page(text: str) -> bool:
+    """
+    Return True if extracted text looks like a page shell rather than real
+    job content -- enough chars to pass MIN_CONTENT but no job vocabulary.
+    Catches custom-domain ATS sites that serve a JS shell whose navigation
+    text alone exceeds the length threshold.
+    """
+    JOB_VOCAB = [
+        "responsibilities", "requirements", "qualifications", "experience",
+        "skills", "you will", "we are looking", "what you'll", "what you will",
+        "the role", "about the role", "job description", "what we offer",
+        "minimum", "preferred", "bachelor", "degree", "years of",
+    ]
+    text_lower = text.lower()
+    return sum(1 for word in JOB_VOCAB if word in text_lower) < 2
 
 
 def scrape_with_requests(url: str, log: logging.Logger):
@@ -440,10 +540,16 @@ def scrape_page(url: str, log: logging.Logger):
         log.warning("[scrape] Skipping blocked domain: %s", domain)
         return None, None
 
-    # Attempt 1
-    text, soup = scrape_with_requests(url, log)
-    if text and len(text) >= MIN_CONTENT:
-        return text, soup
+    # Attempt 1 (skipped for known JS-rendered platforms)
+    if _is_js_rendered(url):
+        log.info("[scrape] Known JS-rendered platform -- skipping requests")
+    else:
+        text, soup = scrape_with_requests(url, log)
+        if text and len(text) >= MIN_CONTENT:
+            if _is_shell_page(text):
+                log.info("[scrape] Shell page detected (no job vocabulary) -- escalating to Selenium")
+            else:
+                return text, soup
 
     # Attempt 2
     log.info("[scrape] Falling back to Selenium...")

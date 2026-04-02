@@ -35,7 +35,7 @@ Register-ScheduledTask `
     -Action $Action `
     -Trigger $Trigger `
     -Settings $Settings `
-    -RunLevel Highest `
+    -RunLevel Limited `
     -Description "Automated job scraper -- runs every $IntervalHr hours"
 
 Write-Host ""
