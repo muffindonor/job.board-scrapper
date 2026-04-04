@@ -130,6 +130,8 @@ JS_RENDERED_DOMAINS = [
     "successfactors.com",   # SAP SuccessFactors
     "eightfold.ai",         # Eightfold AI (AmEx, etc.)
     "comeet.com",           # Comeet (common in Israeli companies)
+    "career.rafael.co.il",  # Rafael career site (JS-rendered)
+    "jobs.smartmfg.com",    # SmartMFG ATS (JS-rendered)
 ]
 
 # Sheet tab names
@@ -191,6 +193,19 @@ JUNIOR_KEYWORDS = re.compile(
     r"\b(entry|junior|graduate|new.?grad|fresh|associate)\b", re.IGNORECASE
 )
 
+# Keywords that identify a senior/leadership role -- excluded from Junior_Jobs
+SENIOR_KEYWORDS = re.compile(
+    r"\b(senior|sr\b|principal|staff|lead|director|manager|head of|architect|vp|chief|distinguished|fellow)\b",
+    re.IGNORECASE
+)
+
+# ATS platforms where the hiring company name lives in the URL path, not the domain.
+# e.g. comeet.com/jobs/blockaid/... -> company = "Blockaid"
+ATS_PATH_DOMAINS = {
+    "comeet.com", "greenhouse.io", "lever.co", "jobvite.com",
+    "smartrecruiters.com", "icims.com", "eightfold.ai",
+}
+
 
 # =============================================================================
 # Text / content helpers
@@ -210,6 +225,36 @@ def is_cloudflare_page(text: str) -> bool:
     return sum(1 for m in CLOUDFLARE_MARKERS if m in lowered) >= 2
 
 
+# Fragments that indicate the AI leaked prompt instructions into a field value
+_PROMPT_LEAK_RE = re.compile(
+    r"(use\s+'?remote'?|n/a\s+if\s+not|if\s+not\s+found|city,\s*country"
+    r"|full.?time[,.]?\s*(tel|israel|n/a)|'remote'\s+if\s+remote)",
+    re.IGNORECASE,
+)
+
+def clean_location(loc: str) -> str:
+    """Normalise AI-extracted location strings and strip prompt leakage."""
+    if not loc or loc.strip() in ("N/A", ""):
+        return "N/A"
+    # Strip prompt instructions that leaked into the value
+    loc = re.sub(r"\.\s*(Use |'Remote'|N/A\s+if|if\s+remote|if\s+not).*", "", loc, flags=re.IGNORECASE)
+    # Normalise "Israel - City" / "Israel – City" → "City, Israel"
+    loc = re.sub(r"^Israel\s*[-–]\s*", "", loc)
+    # Normalise "City District, Israel" → "City, Israel"
+    loc = re.sub(r"\s+District\b", "", loc, flags=re.IGNORECASE)
+    loc = loc.strip().strip(".")
+    return loc or "N/A"
+
+
+def clean_field(value: str, field_name: str = "") -> str:
+    """Strip prompt leakage from description / qualifications fields."""
+    if not value or value.strip() in ("N/A", ""):
+        return "N/A"
+    if _PROMPT_LEAK_RE.search(value):
+        return "N/A"
+    return value.strip() or "N/A"
+
+
 def extract_visible_text(soup: BeautifulSoup) -> str:
     for tag in soup(["script", "style", "nav", "header", "footer", "aside", "noscript"]):
         tag.decompose()
@@ -227,9 +272,35 @@ def create_job_id(title: str, company: str, location: str) -> str:
 
 def extract_company_from_url(url: str) -> str:
     try:
-        domain = urlparse(url).netloc.lower()
-        domain = re.sub(r"^(www\.|careers\.|jobs\.)", "", domain)
-        name = domain.split(".")[0]
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        # Strip common prefixes iteratively (handles www.careers.philips.com)
+        for prefix in ("www.", "careers.", "jobs.", "career.", "apply."):
+            if domain.startswith(prefix):
+                domain = domain[len(prefix):]
+        bare = domain
+
+        # --- ATS platforms: company name is in the URL path, not the domain ---
+        if any(ats in bare for ats in ATS_PATH_DOMAINS):
+            parts = [p for p in parsed.path.strip("/").split("/") if p]
+            # comeet.com/jobs/<company>/...  greenhouse.io/embed/job_board?for=<company>
+            candidate = None
+            if "for=" in parsed.query:
+                m = re.search(r"for=([^&]+)", parsed.query)
+                if m:
+                    candidate = m.group(1)
+            if not candidate and len(parts) >= 2:
+                # skip generic path segments like "jobs", "embed", "job_board"
+                skip = {"jobs", "embed", "job_board", "careers", "apply", "j", "o"}
+                for p in parts:
+                    if p.lower() not in skip:
+                        candidate = p
+                        break
+            if candidate:
+                return re.sub(r"[-_]", " ", candidate).title()
+
+        # --- Known company mappings ---
+        name = bare.split(".")[0]
         known = {
             "microsoft": "Microsoft", "google": "Google", "nvidia": "NVIDIA",
             "apple": "Apple", "intel": "Intel", "amazon": "Amazon",
@@ -237,7 +308,21 @@ def extract_company_from_url(url: str) -> str:
             "sentinelone": "SentinelOne", "mobileye": "Mobileye",
             "paloaltonetworks": "Palo Alto Networks", "appsflyer": "AppsFlyer",
             "akamai": "Akamai", "cadence": "Cadence", "qualcomm": "Qualcomm",
-            "broadcom": "Broadcom", "ibm": "IBM",
+            "broadcom": "Broadcom", "ibm": "IBM", "philips": "Philips",
+            "dell": "Dell", "cisco": "Cisco", "meta": "Meta", "sap": "SAP",
+            "oracle": "Oracle", "hp": "HP", "hpe": "HPE", "amd": "AMD",
+            "mobileye": "Mobileye", "radcom": "RADCOM", "radware": "Radware",
+            "netsuite": "NetSuite", "nice": "NICE", "amdocs": "Amdocs",
+            "harmonicinc": "Harmonic", "cato": "Cato Networks",
+            "lightricks": "Lightricks", "snyk": "Snyk", "unity": "Unity",
+            "wiz": "Wiz", "hibob": "HiBob", "etoro": "eToro",
+            "buildots": "Buildots", "lightrun": "Lightrun", "zafran": "Zafran",
+            "ivix": "IVIX", "dragonflydb": "DragonflyDB", "ai21": "AI21 Labs",
+            "verbit": "Verbit", "ngsoft": "NGSoft", "elspec": "Elspec",
+            "vastdata": "VAST Data", "codevalue": "CodeValue",
+            "sentinelone": "SentinelOne", "geberit": "Geberit",
+            "edwards": "Edwards", "gehealthcare": "GE HealthCare",
+            "odysight": "Odysight", "polytex": "Polytex Technologies",
         }
         return known.get(name, name.title())
     except Exception:
@@ -262,10 +347,24 @@ def is_israeli_location(location: str) -> bool:
     return any(city in loc for city in ISRAELI_CITIES)
 
 
-def classify_role(title: str) -> str:
-    """Return tab name: TAB_STUDENT or TAB_JUNIOR."""
+def classify_role(title: str) -> str | None:
+    """
+    Return tab name (TAB_STUDENT or TAB_JUNIOR) or None to reject.
+
+    Logic:
+      - Student keywords  → always TAB_STUDENT (even if also 'senior', which is unusual)
+      - Senior keywords   → reject (None) -- not a junior role
+      - Junior keywords   → TAB_JUNIOR
+      - No keywords match → TAB_JUNIOR only if no senior signals; otherwise reject
+    """
     if STUDENT_KEYWORDS.search(title):
         return TAB_STUDENT
+    if SENIOR_KEYWORDS.search(title):
+        return None   # senior/principal/lead/director -- skip
+    if JUNIOR_KEYWORDS.search(title):
+        return TAB_JUNIOR
+    # Unclassified: no junior OR senior signal. Keep in Junior_Jobs as a
+    # potential entry-level role (e.g. plain "Software Engineer").
     return TAB_JUNIOR
 
 
@@ -502,7 +601,7 @@ def scrape_with_uc(url: str, log: logging.Logger):
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--window-size=1920,1080")
-        driver = uc.Chrome(options=opts, headless=True)
+        driver = uc.Chrome(options=opts, headless=True, version_main=146)
         driver.set_page_load_timeout(40)
         driver.get(url)
         time.sleep(6)
@@ -690,20 +789,26 @@ def _parse_ai_response(raw: str, log: logging.Logger) -> list:
 
 def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger) -> dict:
     """
-    Filter raw AI output. Returns {"student": [...], "junior": [...]}.
+    Filter raw AI output. Returns {"Student_Jobs": [...], "Junior_Jobs": [...]}.
     """
     results = {TAB_STUDENT: [], TAB_JUNIOR: []}
 
     for job in jobs:
-        title = str(job.get("title", "")).strip()
-        location = str(job.get("location", "")).strip()
-        company = str(job.get("company", "")).strip()
+        title    = str(job.get("title", "")).strip()
+        location = clean_location(str(job.get("location", "")).strip())
+        company  = str(job.get("company", "")).strip()
 
         if not title:
             continue
 
         if not is_software_role(title):
             log.debug("[filter] Skipping non-SW role: %s", title)
+            continue
+
+        # Classify first -- rejects senior/principal/lead/director roles
+        tab = classify_role(title)
+        if tab is None:
+            log.debug("[filter] Skipping senior/lead role: %s", title)
             continue
 
         if not is_israeli_location(location):
@@ -720,18 +825,28 @@ def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger) -> dict:
             log.debug("[filter] Duplicate: %s @ %s", title, company)
             continue
 
+        description    = clean_field(str(job.get("description",    "N/A")), "description")
+        qualifications = clean_field(str(job.get("qualifications", "N/A")), "qualifications")
+
+        # Quality gate: skip hollow entries with no useful content at all
+        if description == "N/A" and qualifications == "N/A":
+            log.debug("[filter] Skipping hollow job (no description or qualifications): %s @ %s", title, company)
+            # Still save if we at least have a direct job URL (title + URL is useful)
+            job_url = str(job.get("url", "")).strip()
+            if not job_url or job_url == str(job.get("source_url", "")):
+                continue
+
         existing_ids.add(job_id)
 
-        tab = classify_role(title)
         results[tab].append({
-            "date_posted":  date_posted or "N/A",
-            "date_added":   datetime.now().strftime("%Y-%m-%d"),
-            "company":      company or "N/A",
-            "title":        title,
-            "description":  str(job.get("description", "N/A")).strip() or "N/A",
-            "qualifications": str(job.get("qualifications", "N/A")).strip() or "N/A",
-            "location":     location or "N/A",
-            "url":          str(job.get("url", "")).strip(),
+            "date_posted":    date_posted or "N/A",
+            "date_added":     datetime.now().strftime("%Y-%m-%d"),
+            "company":        company or "N/A",
+            "title":          title,
+            "description":    description,
+            "qualifications": qualifications,
+            "location":       location,
+            "url":            str(job.get("url", "")).strip(),
         })
 
     return results
@@ -816,17 +931,15 @@ def _format_header(ws, log: logging.Logger):
         log.warning("[sheets] Header formatting failed: %s", e)
 
 
-def _format_data_row(ws, row_number: int, log: logging.Logger):
-    """Wrap all cols, clip URL col, cap row height -- single batch_update."""
-    try:
-        row_idx = row_number - 1
-        url_col_idx = SHEET_COLUMNS.index("URL")
-        n_cols = len(SHEET_COLUMNS)
+def _build_row_format_requests(ws, row_number: int) -> list:
+    """Return the batch_update request dicts for a single data row (does NOT call API)."""
+    row_idx    = row_number - 1
+    url_col_idx = SHEET_COLUMNS.index("URL")
+    n_cols     = len(SHEET_COLUMNS)
 
-        format_requests = []
-
+    return [
         # All columns: wrap
-        format_requests.append({
+        {
             "repeatCell": {
                 "range": {
                     "sheetId": ws.id,
@@ -840,10 +953,9 @@ def _format_data_row(ws, row_number: int, log: logging.Logger):
                 }},
                 "fields": "userEnteredFormat(wrapStrategy,verticalAlignment,textFormat)",
             }
-        })
-
+        },
         # URL column: clip instead of wrap
-        format_requests.append({
+        {
             "repeatCell": {
                 "range": {
                     "sheetId": ws.id,
@@ -857,10 +969,9 @@ def _format_data_row(ws, row_number: int, log: logging.Logger):
                 }},
                 "fields": "userEnteredFormat(wrapStrategy,verticalAlignment,textFormat)",
             }
-        })
-
+        },
         # Row height cap
-        format_requests.append({
+        {
             "updateDimensionProperties": {
                 "range": {
                     "sheetId": ws.id, "dimension": "ROWS",
@@ -869,9 +980,14 @@ def _format_data_row(ws, row_number: int, log: logging.Logger):
                 "properties": {"pixelSize": 120},
                 "fields": "pixelSize",
             }
-        })
+        },
+    ]
 
-        ws.spreadsheet.batch_update({"requests": format_requests})
+
+def _format_data_row(ws, row_number: int, log: logging.Logger):
+    """Format a single data row (kept for backward-compat; prefer batching)."""
+    try:
+        ws.spreadsheet.batch_update({"requests": _build_row_format_requests(ws, row_number)})
     except Exception as e:
         log.warning("[sheets] Row formatting failed: %s", e)
 
@@ -903,7 +1019,7 @@ def load_existing_ids(worksheets: dict, log: logging.Logger) -> set:
 
 
 def save_jobs_to_tab(ws, jobs: list, tab_name: str, log: logging.Logger):
-    """Append new jobs to a tab in batches, with rate-limit retry."""
+    """Append new jobs to a tab in batches, then format all new rows in ONE batch_update call."""
     if not jobs:
         return
 
@@ -912,21 +1028,23 @@ def save_jobs_to_tab(ws, jobs: list, tab_name: str, log: logging.Logger):
                  "description", "qualifications", "location", "url"]
     rows = [[job.get(k, "") for k in key_order] for job in jobs]
 
+    # --- Step 1: write all data rows in batches with rate-limit retry ---
+    first_new_row = None   # track where new rows started (1-based)
     BATCH = 10
     for i in range(0, len(rows), BATCH):
         batch = rows[i:i + BATCH]
         for attempt in range(3):
             try:
                 ws.append_rows(batch, value_input_option="RAW")
-                # Format each new row
-                current_row = len(ws.get_all_values())
-                for offset in range(len(batch)):
-                    _format_data_row(ws, current_row - len(batch) + offset + 1, log)
+                if first_new_row is None:
+                    # After the first successful write, record starting row
+                    first_new_row = len(ws.get_all_values()) - len(rows) + 1
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
-                    log.warning("[sheets] Rate limit hit -- waiting 15s...")
-                    time.sleep(15)
+                    wait = 30 if attempt > 0 else 15
+                    log.warning("[sheets] Rate limit hit -- waiting %ds...", wait)
+                    time.sleep(wait)
                 else:
                     log.error("[sheets] API error: %s", e)
                     break
@@ -936,7 +1054,22 @@ def save_jobs_to_tab(ws, jobs: list, tab_name: str, log: logging.Logger):
                     time.sleep(5)
 
         if i + BATCH < len(rows):
-            time.sleep(3)  # gentle pacing between batches
+            time.sleep(2)  # gentle pacing between batches
+
+    # --- Step 2: format ALL new rows in a SINGLE batch_update call ---
+    if first_new_row is not None:
+        all_format_reqs = []
+        for offset in range(len(rows)):
+            all_format_reqs.extend(_build_row_format_requests(ws, first_new_row + offset))
+        try:
+            # Split into chunks of 100 requests to stay within API limits
+            CHUNK = 100
+            for i in range(0, len(all_format_reqs), CHUNK):
+                ws.spreadsheet.batch_update({"requests": all_format_reqs[i:i + CHUNK]})
+                if i + CHUNK < len(all_format_reqs):
+                    time.sleep(2)
+        except Exception as e:
+            log.warning("[sheets] Batch row formatting failed: %s", e)
 
     log.info("[sheets] Done saving to %s", tab_name)
 
