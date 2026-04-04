@@ -80,6 +80,119 @@ def setup_logging(debug: bool = False) -> logging.Logger:
     return logging.getLogger("job_scraper")
 
 
+# Lines matching any of these patterns are stripped from the clean debug file.
+_NOISE_PATTERNS = [
+    re.compile(r"====== WebDriver manager ======"),
+    re.compile(r"Get LATEST chromedriver version"),
+    re.compile(r"Driver \[.*\] found in cache"),
+    re.compile(r"DevTools listening on ws://"),
+    re.compile(r"Exception ignored in:.*Chrome\.__del__"),
+    re.compile(r"Traceback \(most recent call last\):"),
+    re.compile(r'File ".*undetected_chromedriver.*", line \d+'),
+    re.compile(r"self\.quit\(\)"),
+    re.compile(r"time\.sleep\(0\.1\)"),
+    re.compile(r"OSError: \[WinError 6\]"),
+]
+
+def _is_noise(line: str) -> bool:
+    s = line.strip()
+    return any(p.search(s) for p in _NOISE_PATTERNS)
+
+
+def write_debug_report(
+    debug_path: Path,
+    url_results: list,
+    log_file: Path,
+    run_start: datetime,
+    duration,
+    sheet_url: str,
+):
+    """
+    Write a clean, human-readable debug report to debug_path.
+
+    url_results status values:
+      FAILED   -- could not scrape at all
+      NO_JOBS  -- scraped OK, AI found no jobs
+      FILTERED -- AI found jobs but all were filtered (senior/non-IL/duplicate/hollow)
+      SAVED    -- at least one job written to the sheet
+    """
+    failed   = [r for r in url_results if r["status"] == "FAILED"]
+    no_jobs  = [r for r in url_results if r["status"] == "NO_JOBS"]
+    filtered = [r for r in url_results if r["status"] == "FILTERED"]
+    saved    = [r for r in url_results if r["status"] == "SAVED"]
+
+    lines = []
+    sep  = "=" * 70
+    sep2 = "-" * 70
+
+    lines += [
+        sep,
+        f"  JOB SCRAPER DEBUG REPORT",
+        f"  Run started : {run_start.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"  Duration    : {str(duration).split('.')[0]}",
+        f"  Sheet       : {sheet_url}",
+        sep,
+        "",
+        "  URL SUMMARY",
+        sep2,
+        f"  {'SAVED':<10} {len(saved):>3}  -- jobs written to sheet",
+        f"  {'FILTERED':<10} {len(filtered):>3}  -- scraped OK, all jobs rejected (senior/non-IL/duplicate)",
+        f"  {'NO_JOBS':<10} {len(no_jobs):>3}  -- scraped OK, AI found nothing",
+        f"  {'FAILED':<10} {len(failed):>3}  -- could not scrape (blocked/broken URL)",
+        sep2,
+        "",
+    ]
+
+    if failed:
+        lines.append("  !! FAILED URLs  (check / update these in company_urls.txt)")
+        lines.append(sep2)
+        for r in failed:
+            lines.append(f"  {r['url']}")
+        lines.append("")
+
+    if filtered:
+        lines.append("  ?? FILTERED URLs  (page scraped, but all jobs were rejected)")
+        lines.append("     Possible reasons: only senior roles, non-Israel, duplicates.")
+        lines.append(sep2)
+        for r in filtered:
+            lines.append(f"  {r['url']}  [{r['jobs_found']} raw job(s) found, 0 kept]")
+        lines.append("")
+
+    if no_jobs:
+        lines.append("  -- NO_JOBS URLs  (page loaded, AI extracted nothing)")
+        lines.append("     May be a listing page with no matching roles right now,")
+        lines.append("     or the URL points to a category/tag page rather than jobs.")
+        lines.append(sep2)
+        for r in no_jobs:
+            lines.append(f"  {r['url']}")
+        lines.append("")
+
+    if saved:
+        lines.append("  OK SAVED URLs  (produced at least one new job)")
+        lines.append(sep2)
+        for r in saved:
+            s = r["jobs_saved"]
+            lines.append(f"  {r['url']}  [{s} job(s) saved]")
+        lines.append("")
+
+    lines += [
+        sep,
+        "  SCRAPE LOG  (noise-filtered)",
+        sep,
+        "",
+    ]
+
+    if log_file.exists():
+        raw = log_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        for line in raw:
+            if not _is_noise(line):
+                lines.append(line)
+    else:
+        lines.append("  (log file not found)")
+
+    debug_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 # =============================================================================
 # Constants / defaults
 # =============================================================================
@@ -1168,6 +1281,7 @@ def main():
     start_time = datetime.now()
     all_new = {TAB_STUDENT: [], TAB_JUNIOR: []}
     failed_urls = []
+    url_results = []   # [{url, status, jobs_found, jobs_saved}] for debug report
 
     for i, url in enumerate(urls, 1):
         domain = urlparse(url).netloc
@@ -1178,6 +1292,7 @@ def main():
             if not text:
                 log.warning("  Could not scrape -- skipping")
                 failed_urls.append(url)
+                url_results.append({"url": url, "status": "FAILED", "jobs_found": 0, "jobs_saved": 0})
                 continue
 
             company = extract_company_from_url(url)
@@ -1185,6 +1300,7 @@ def main():
 
             if not raw_jobs:
                 log.info("  No jobs extracted from this page")
+                url_results.append({"url": url, "status": "NO_JOBS", "jobs_found": 0, "jobs_saved": 0})
             else:
                 # Inject company name into each job before filtering
                 for job in raw_jobs:
@@ -1194,15 +1310,22 @@ def main():
                 categorized = filter_jobs(raw_jobs, existing_ids, log)
                 n_student = len(categorized[TAB_STUDENT])
                 n_junior  = len(categorized[TAB_JUNIOR])
+                n_saved   = n_student + n_junior
                 log.info("  Found: %d student, %d junior", n_student, n_junior)
                 all_new[TAB_STUDENT].extend(categorized[TAB_STUDENT])
                 all_new[TAB_JUNIOR].extend(categorized[TAB_JUNIOR])
+
+                if n_saved > 0:
+                    url_results.append({"url": url, "status": "SAVED",    "jobs_found": len(raw_jobs), "jobs_saved": n_saved})
+                else:
+                    url_results.append({"url": url, "status": "FILTERED", "jobs_found": len(raw_jobs), "jobs_saved": 0})
 
         except Exception as e:
             log.error("  Unexpected error: %s", e)
             if args.debug:
                 log.debug(traceback.format_exc())
             failed_urls.append(url)
+            url_results.append({"url": url, "status": "FAILED", "jobs_found": 0, "jobs_saved": 0})
 
         # Polite delay between sites
         if i < len(urls):
@@ -1228,6 +1351,14 @@ def main():
             print(f"    - {u}")
     print(f"  Sheet: {sheet_url}")
     print("=" * 60)
+
+    # -- 8. Write clean debug report -------------------------------------------
+    debug_dir  = Path("debug")
+    debug_dir.mkdir(exist_ok=True)
+    debug_file = debug_dir / f"debug_{start_time.strftime('%Y%m%d_%H%M')}.txt"
+    log_file   = Path("logs") / f"job_scraper_{start_time.strftime('%Y%m%d')}.log"
+    write_debug_report(debug_file, url_results, log_file, start_time, duration, sheet_url)
+    print(f"  Debug report:   {debug_file}")
 
 
 if __name__ == "__main__":
