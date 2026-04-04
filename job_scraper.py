@@ -263,6 +263,10 @@ COL_WIDTHS = [110, 110, 150, 220, 480, 350, 140, 280]
 # AI fields that must not all be N/A (job quality gate)
 NA_ABORT_THRESHOLD = 3   # abort job entry if this many core fields are N/A
 
+# Two-pass detail fetching
+DETAIL_FETCH_MAX     = 10   # max detail pages to follow per listing URL
+DETAIL_MIN_CONTENT   = 300  # min chars to consider a detail page useful
+
 OLLAMA_CONFIG = {
     "base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
     "model":    os.getenv("OLLAMA_MODEL",    "qwen2.5:7b"),
@@ -897,6 +901,227 @@ def _parse_ai_response(raw: str, log: logging.Logger) -> list:
 
 
 # =============================================================================
+# Two-pass detail enrichment
+# =============================================================================
+
+DETAIL_PROMPT = """You are extracting details from a single job posting page.
+
+Company: {company}
+Job title (already known): {title}
+
+--- PAGE CONTENT ---
+{content}
+--- END CONTENT ---
+
+Return ONLY a valid JSON object with no preamble or markdown fences:
+{{
+  "location":       "City, Country. Use 'Remote' if remote. 'N/A' if not found.",
+  "description":    "1-2 sentence summary of what the role involves. 'N/A' if not found.",
+  "qualifications": "Key requirements comma-separated. 'N/A' if not found.",
+  "date_posted":    "Date in YYYY-MM-DD format if listed, otherwise 'N/A'"
+}}
+
+Rules:
+- Output ONLY the JSON object.
+- Do not repeat the job title.
+- For Israeli locations use common English spellings.
+"""
+
+
+def _is_detail_url(job_url: str, listing_url: str) -> bool:
+    """
+    Return True if job_url looks like an individual job detail page
+    rather than an echo of the listing URL.
+    """
+    if not job_url:
+        return False
+    # Same URL as the listing page -- AI just echoed it back
+    if job_url.rstrip("/") == listing_url.rstrip("/"):
+        return False
+    # Must be HTTP(S)
+    if not job_url.startswith("http"):
+        return False
+    # Sanity: same domain or a known ATS domain is fine; completely
+    # unrelated domains are likely hallucinations -- skip them.
+    listing_domain = urlparse(listing_url).netloc.lower()
+    job_domain     = urlparse(job_url).netloc.lower()
+    if job_domain != listing_domain:
+        # Allow known ATS redirects (e.g. listing on company site,
+        # detail on greenhouse.io / lever.co / comeet.com)
+        ats_domains = {
+            "greenhouse.io", "lever.co", "comeet.com", "myworkdayjobs.com",
+            "smartrecruiters.com", "jobvite.com", "icims.com", "taleo.net",
+            "oraclecloud.com", "successfactors.com", "eightfold.ai",
+        }
+        if not any(ats in job_domain for ats in ats_domains):
+            return False
+    return True
+
+
+def _scrape_detail_page(url: str, log: logging.Logger) -> str:
+    """
+    Lightweight scrape of a single job detail page.
+    Tries requests first; falls back to Selenium for JS-rendered domains.
+    Returns visible text or empty string.
+    """
+    # Fast path: plain HTTP request
+    if not _is_js_rendered(url):
+        try:
+            session = requests.Session()
+            session.headers.update(HEADERS)
+            resp = session.get(url, timeout=15)
+            resp.raise_for_status()
+            if resp.encoding and resp.encoding.lower() in ("latin-1", "iso-8859-1"):
+                resp.encoding = resp.apparent_encoding
+            if not is_cloudflare_page(resp.text):
+                soup = BeautifulSoup(resp.text, "html.parser")
+                text = extract_visible_text(soup)
+                if len(text) >= DETAIL_MIN_CONTENT:
+                    log.debug("[detail] requests OK -- %d chars", len(text))
+                    return text
+        except Exception as e:
+            log.debug("[detail] requests failed: %s", e)
+
+    # Selenium fallback for JS-rendered or failed requests
+    if SELENIUM_AVAILABLE:
+        try:
+            service = Service(ChromeDriverManager().install())
+        except Exception:
+            service = Service()
+        driver = None
+        try:
+            driver = webdriver.Chrome(service=service, options=_build_chrome_options())
+            driver.set_page_load_timeout(25)
+            driver.get(url)
+            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            _smart_wait(driver, log)
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            text = extract_visible_text(soup)
+            log.debug("[detail] selenium OK -- %d chars", len(text))
+            return text if len(text) >= DETAIL_MIN_CONTENT else ""
+        except Exception as e:
+            log.debug("[detail] selenium failed: %s", e)
+        finally:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+    return ""
+
+
+def _call_ollama_detail(content: str, company: str, title: str, log: logging.Logger) -> dict:
+    """Call Ollama on a detail page and return enrichment fields dict."""
+    prompt = DETAIL_PROMPT.format(
+        company=company,
+        title=title,
+        content=content[:6000],
+    )
+    base_url = OLLAMA_CONFIG["base_url"]
+    model    = OLLAMA_CONFIG["model"]
+
+    for use_json_fmt in (True, False):
+        payload = {
+            "model":   model,
+            "prompt":  prompt,
+            "stream":  False,
+            "options": {"temperature": 0.05, "top_p": 0.9, "num_predict": 1024},
+        }
+        if use_json_fmt:
+            payload["format"] = "json"
+        try:
+            resp = requests.post(
+                f"{base_url}/api/generate",
+                json=payload,
+                timeout=OLLAMA_CONFIG["timeout"],
+            )
+            if resp.status_code == 500 and use_json_fmt:
+                continue
+            resp.raise_for_status()
+            raw = resp.json().get("response", "")
+            if not raw:
+                return {}
+            # Parse the flat dict response
+            raw = raw.strip()
+            raw = re.sub(r"^```(?:json)?\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+            raw = re.sub(r",\s*([}\]])", r"", raw)
+            start = raw.find("{")
+            end   = raw.rfind("}") + 1
+            if start == -1 or end <= start:
+                return {}
+            return json.loads(raw[start:end])
+        except Exception:
+            if not use_json_fmt:
+                return {}
+    return {}
+
+
+def enrich_jobs_with_detail_pages(
+    jobs: list,
+    listing_url: str,
+    company: str,
+    log: logging.Logger,
+) -> list:
+    """
+    For each job extracted from a listing page, if it has a distinct detail
+    URL and is missing description/qualifications, fetch that page and ask
+    the AI to fill in the blanks.
+
+    Only follows detail URLs for jobs that pass the lightweight pre-filter
+    (SW role, not senior) to avoid wasting time on roles that will be
+    rejected anyway.
+
+    Mutates jobs in-place and returns the same list.
+    """
+    candidates = [
+        j for j in jobs
+        if is_software_role(str(j.get("title", "")))
+        and classify_role(str(j.get("title", ""))) is not None
+        and _is_detail_url(str(j.get("url", "")), listing_url)
+        and (
+            str(j.get("description",    "")).strip() in ("", "N/A")
+            or str(j.get("qualifications", "")).strip() in ("", "N/A")
+        )
+    ]
+
+    if not candidates:
+        return jobs
+
+    fetched = 0
+    for job in candidates:
+        if fetched >= DETAIL_FETCH_MAX:
+            log.debug("[detail] cap reached (%d), stopping detail fetches", DETAIL_FETCH_MAX)
+            break
+
+        detail_url = str(job.get("url", "")).strip()
+        title      = str(job.get("title", "")).strip()
+        log.info("[detail] fetching %s", detail_url)
+
+        text = _scrape_detail_page(detail_url, log)
+        fetched += 1
+
+        if not text:
+            log.debug("[detail] no content for: %s", detail_url)
+            continue
+
+        enrichment = _call_ollama_detail(text, company, title, log)
+        if not enrichment:
+            continue
+
+        # Only overwrite fields that were missing
+        for field in ("description", "qualifications", "location", "date_posted"):
+            existing = str(job.get(field, "")).strip()
+            new_val  = str(enrichment.get(field, "")).strip()
+            if existing in ("", "N/A") and new_val and new_val != "N/A":
+                job[field] = new_val
+                log.debug("[detail] enriched %s.%s = %s", title, field, new_val[:60])
+
+    return jobs
+
+
+# =============================================================================
 # Filtering & deduplication
 # =============================================================================
 
@@ -1306,6 +1531,9 @@ def main():
                 for job in raw_jobs:
                     if not job.get("company"):
                         job["company"] = company
+
+                # Two-pass: follow individual job URLs to fill in missing fields
+                raw_jobs = enrich_jobs_with_detail_pages(raw_jobs, url, company, log)
 
                 categorized = filter_jobs(raw_jobs, existing_ids, log)
                 n_student = len(categorized[TAB_STUDENT])
