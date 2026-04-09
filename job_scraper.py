@@ -908,17 +908,25 @@ def _parse_ai_response(raw: str, log: logging.Logger) -> list:
 # =============================================================================
 
 JOBSPY_CONFIG = {
-    # Search terms run against Indeed Israel.
-    # Two passes: one for intern/student roles, one for general SW roles.
+    # Search terms shared by Indeed, LinkedIn, Glassdoor, and Bayt.
     "search_terms": {
-        TAB_STUDENT: "software engineer intern student Israel",
-        TAB_JUNIOR:  "junior software engineer Israel",
+        TAB_STUDENT: "software engineer intern",
+        TAB_JUNIOR:  "junior software engineer",
     },
-    "location":      "Israel",
+    # Google Jobs needs its own freeform search string -- be very specific
+    # or it returns globally-mixed results.
+    "google_search_terms": {
+        TAB_STUDENT: "software engineer intern Israel Tel Aviv",
+        TAB_JUNIOR:  "junior software engineer Israel Tel Aviv",
+    },
+    "location":       "Israel",
     "country_indeed": "Israel",
-    "results_wanted": 50,    # per search term
-    "hours_old":      168,   # last 7 days
-    "sites":          ["indeed"],
+    "results_wanted": 30,   # per site per search term
+    "hours_old":      168,  # last 7 days
+
+    # Sites to query. ZipRecruiter excluded -- US-only inventory.
+    # linkedin_fetch_description fetches full descriptions (slower but worth it).
+    "sites":          ["indeed", "linkedin", "glassdoor", "google", "bayt"],
 }
 
 
@@ -944,13 +952,12 @@ def _jobspy_row_to_job(row) -> dict:
     elif country:
         location = country
     else:
-        location = "Israel"   # we searched Israel, so default is safe
+        location = "Israel"
 
-    # Date: JobSpy returns a date object or string
+    # Normalise date to YYYY-MM-DD
     date_posted = safe(getattr(row, "date_posted", None))
     if date_posted and date_posted != "N/A":
         try:
-            # Normalise to YYYY-MM-DD regardless of input format
             import datetime as dt
             if hasattr(date_posted, "strftime"):
                 date_posted = date_posted.strftime("%Y-%m-%d")
@@ -965,51 +972,77 @@ def _jobspy_row_to_job(row) -> dict:
         "company":        safe(getattr(row, "company",     None)),
         "location":       location,
         "description":    safe(getattr(row, "description", None)),
-        "qualifications": "N/A",   # Indeed doesn't separate qualifications
+        "qualifications": "N/A",
         "date_posted":    date_posted,
         "url":            safe(getattr(row, "job_url",     None)),
     }
 
 
+def _jobspy_call(site: str, search_term: str, google_search_term: str,
+                 log: logging.Logger):
+    """
+    Run a single JobSpy scrape for one site + search term.
+    Returns a DataFrame or None.
+    """
+    import warnings
+    kwargs = dict(
+        site_name          = [site],
+        search_term        = search_term,
+        location           = JOBSPY_CONFIG["location"],
+        results_wanted     = JOBSPY_CONFIG["results_wanted"],
+        hours_old          = JOBSPY_CONFIG["hours_old"],
+        description_format = "markdown",
+    )
+
+    if site == "indeed":
+        kwargs["country_indeed"] = JOBSPY_CONFIG["country_indeed"]
+
+    if site == "linkedin":
+        # Fetch full descriptions -- slower but gives qualifications text
+        kwargs["linkedin_fetch_description"] = True
+
+    if site == "google":
+        # Google ignores search_term and uses only google_search_term
+        kwargs["google_search_term"] = google_search_term
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return jobspy_scrape(**kwargs)
+    except Exception as e:
+        log.error("[jobspy] %s search failed for %r: %s", site.capitalize(), search_term, e)
+        return None
+
+
 def run_jobspy(log: logging.Logger) -> list:
     """
-    Run JobSpy searches against Indeed Israel.
+    Run JobSpy searches across Indeed, LinkedIn, Glassdoor, Google, and Bayt
+    for Israeli software engineering roles.
     Returns a flat list of job dicts in filter_jobs() format.
     """
     if not JOBSPY_AVAILABLE:
         log.warning("[jobspy] python-jobspy not installed -- skipping (pip install python-jobspy)")
         return []
 
-    import warnings
     all_jobs = []
+    sites    = JOBSPY_CONFIG["sites"]
 
     for tab, term in JOBSPY_CONFIG["search_terms"].items():
-        log.info("[jobspy] Searching Indeed: %r ...", term)
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                df = jobspy_scrape(
-                    site_name       = JOBSPY_CONFIG["sites"],
-                    search_term     = term,
-                    location        = JOBSPY_CONFIG["location"],
-                    country_indeed  = JOBSPY_CONFIG["country_indeed"],
-                    results_wanted  = JOBSPY_CONFIG["results_wanted"],
-                    hours_old       = JOBSPY_CONFIG["hours_old"],
-                    description_format = "markdown",
-                )
+        google_term = JOBSPY_CONFIG["google_search_terms"][tab]
+
+        for site in sites:
+            log.info("[jobspy] %s: searching %r ...", site.capitalize(), term)
+            df = _jobspy_call(site, term, google_term, log)
 
             if df is None or df.empty:
-                log.info("[jobspy]   No results for %r", term)
+                log.info("[jobspy]   No results")
                 continue
 
-            log.info("[jobspy]   %d raw results for %r", len(df), term)
+            log.info("[jobspy]   %d raw results", len(df))
             for _, row in df.iterrows():
                 all_jobs.append(_jobspy_row_to_job(row))
 
-        except Exception as e:
-            log.error("[jobspy] Search failed for %r: %s", term, e)
-
-    log.info("[jobspy] Total raw jobs from Indeed: %d", len(all_jobs))
+    log.info("[jobspy] Total raw jobs across all sites: %d", len(all_jobs))
     return all_jobs
 
 
@@ -1416,7 +1449,7 @@ def main():
             all_new[TAB_STUDENT].extend(jobspy_categorized[TAB_STUDENT])
             all_new[TAB_JUNIOR].extend(jobspy_categorized[TAB_JUNIOR])
             url_results.append({
-                "url":        "Indeed Israel (JobSpy)",
+                "url":        "JobSpy (Indeed/LinkedIn/Glassdoor/Google/Bayt)",
                 "status":     "SAVED" if n_saved > 0 else "FILTERED",
                 "jobs_found": len(jobspy_jobs),
                 "jobs_saved": n_saved,
@@ -1482,14 +1515,14 @@ def main():
     duration = datetime.now() - start_time
     total = len(all_new[TAB_STUDENT]) + len(all_new[TAB_JUNIOR])
 
-    jobspy_result = next((r for r in url_results if r["url"] == "Indeed Israel (JobSpy)"), None)
+    jobspy_result = next((r for r in url_results if r["url"].startswith("JobSpy")), None)
 
     print("\n" + "=" * 60)
     print("  COMPLETED")
     print("=" * 60)
     print(f"  Duration:       {str(duration).split('.')[0]}")
     if jobspy_result:
-        print(f"  Indeed (JobSpy): {jobspy_result['jobs_saved']} saved "
+        print(f"  JobSpy:          {jobspy_result['jobs_saved']} saved "
               f"({jobspy_result['jobs_found']} raw)")
     print(f"  URLs scraped:   {len(urls) - len(failed_urls)}/{len(urls)}")
     print(f"  New jobs saved: {total} ({len(all_new[TAB_STUDENT])} student, {len(all_new[TAB_JUNIOR])} junior)")
