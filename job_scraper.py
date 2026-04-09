@@ -24,6 +24,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
+import socket
 
 import requests
 import gspread
@@ -249,9 +250,9 @@ JS_RENDERED_DOMAINS = [
     "jobvite.com",          # Jobvite
     "successfactors.com",   # SAP SuccessFactors
     "eightfold.ai",         # Eightfold AI (AmEx, etc.)
-    "comeet.com",           # Comeet (common in Israeli companies)
-    "career.rafael.co.il",  # Rafael career site (JS-rendered)
-    "jobs.smartmfg.com",    # SmartMFG ATS (JS-rendered)
+    "comeet.com",              # Comeet (common in Israeli companies)
+    "career.rafael.co.il",     # Rafael career site (JS-rendered)
+    "jobs.careers.microsoft.com",  # Microsoft careers (SSL cert mismatch)
 ]
 
 # Sheet tab names
@@ -515,6 +516,7 @@ def _build_chrome_options() -> Options:
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-background-networking")
     opts.add_argument("--disable-features=TranslateUI")
+    opts.add_argument("--ignore-certificate-errors")
     opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_experimental_option("prefs", {
@@ -655,8 +657,8 @@ def scrape_with_requests(url: str, log: logging.Logger):
             return text, soup
         except requests.exceptions.HTTPError as e:
             code = e.response.status_code if e.response is not None else 0
-            if code in (403, 429):
-                log.warning("[requests] Blocked (%d) -- escalating", code)
+            if code in (403, 404, 410, 429):
+                log.warning("[requests] Dead/blocked (%d) -- not escalating", code)
                 return None, None
             log.warning("[requests] HTTP error attempt %d: %s", attempt + 1, e)
         except requests.exceptions.RequestException as e:
@@ -749,6 +751,19 @@ def scrape_with_uc(url: str, log: logging.Logger):
                 pass
 
 
+
+def _dns_check(url: str, log: logging.Logger) -> bool:
+    """Return True if the hostname resolves, False if DNS lookup fails."""
+    try:
+        hostname = urlparse(url).hostname
+        if not hostname:
+            return False
+        socket.getaddrinfo(hostname, None)
+        return True
+    except socket.gaierror:
+        log.warning("[scrape] DNS resolution failed for %s -- skipping", hostname)
+        return False
+
 def scrape_page(url: str, log: logging.Logger):
     """
     Try requests -> Selenium -> undetected-chromedriver.
@@ -757,6 +772,10 @@ def scrape_page(url: str, log: logging.Logger):
     domain = urlparse(url).netloc.lower()
     if any(blocked in domain for blocked in BLOCKED_DOMAINS):
         log.warning("[scrape] Skipping blocked domain: %s", domain)
+        return None, None
+
+    # Pre-flight DNS check -- avoids burning ~13s on dead hostnames
+    if not _dns_check(url, log):
         return None, None
 
     # Attempt 1 (skipped for known JS-rendered platforms)
@@ -1065,13 +1084,13 @@ def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger) -> dict:
             continue
 
         if not is_software_role(title):
-            log.debug("[filter] Skipping non-SW role: %s", title)
+            log.info("[filter] SKIP non-SW:     %s", title)
             continue
 
         # Classify first -- rejects senior/principal/lead/director roles
         tab = classify_role(title)
         if tab is None:
-            log.debug("[filter] Skipping senior/lead role: %s", title)
+            log.info("[filter] SKIP senior/lead: %s", title)
             continue
 
         if not is_israeli_location(location):
@@ -1292,16 +1311,15 @@ def save_jobs_to_tab(ws, jobs: list, tab_name: str, log: logging.Logger):
     rows = [[job.get(k, "") for k in key_order] for job in jobs]
 
     # --- Step 1: write all data rows in batches with rate-limit retry ---
-    first_new_row = None   # track where new rows started (1-based)
+    # Snapshot row count BEFORE any writes so formatting offsets are exact
+    first_new_row = len(ws.get_all_values()) + 1
+
     BATCH = 10
     for i in range(0, len(rows), BATCH):
         batch = rows[i:i + BATCH]
         for attempt in range(3):
             try:
                 ws.append_rows(batch, value_input_option="RAW")
-                if first_new_row is None:
-                    # After the first successful write, record starting row
-                    first_new_row = len(ws.get_all_values()) - len(rows) + 1
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -1319,7 +1337,7 @@ def save_jobs_to_tab(ws, jobs: list, tab_name: str, log: logging.Logger):
         if i + BATCH < len(rows):
             time.sleep(2)  # gentle pacing between batches
 
-    # --- Step 2: format ALL new rows in a SINGLE batch_update call ---
+    # --- Step 3: format ALL new rows in a SINGLE batch_update call ---
     if first_new_row is not None:
         all_format_reqs = []
         for offset in range(len(rows)):
