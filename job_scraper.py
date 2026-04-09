@@ -50,6 +50,13 @@ try:
 except ImportError:
     UC_AVAILABLE = False
 
+# -- Optional JobSpy (Indeed integration) -------------------------------------
+try:
+    from jobspy import scrape_jobs as jobspy_scrape
+    JOBSPY_AVAILABLE = True
+except ImportError:
+    JOBSPY_AVAILABLE = False
+
 
 # =============================================================================
 # Logging
@@ -262,10 +269,6 @@ COL_WIDTHS = [110, 110, 150, 220, 480, 350, 140, 280]
 
 # AI fields that must not all be N/A (job quality gate)
 NA_ABORT_THRESHOLD = 3   # abort job entry if this many core fields are N/A
-
-# Two-pass detail fetching
-DETAIL_FETCH_MAX     = 10   # max detail pages to follow per listing URL
-DETAIL_MIN_CONTENT   = 300  # min chars to consider a detail page useful
 
 OLLAMA_CONFIG = {
     "base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
@@ -901,224 +904,113 @@ def _parse_ai_response(raw: str, log: logging.Logger) -> list:
 
 
 # =============================================================================
-# Two-pass detail enrichment
+# JobSpy / Indeed integration
 # =============================================================================
 
-DETAIL_PROMPT = """You are extracting details from a single job posting page.
-
-Company: {company}
-Job title (already known): {title}
-
---- PAGE CONTENT ---
-{content}
---- END CONTENT ---
-
-Return ONLY a valid JSON object with no preamble or markdown fences:
-{{
-  "location":       "City, Country. Use 'Remote' if remote. 'N/A' if not found.",
-  "description":    "1-2 sentence summary of what the role involves. 'N/A' if not found.",
-  "qualifications": "Key requirements comma-separated. 'N/A' if not found.",
-  "date_posted":    "Date in YYYY-MM-DD format if listed, otherwise 'N/A'"
-}}
-
-Rules:
-- Output ONLY the JSON object.
-- Do not repeat the job title.
-- For Israeli locations use common English spellings.
-"""
+JOBSPY_CONFIG = {
+    # Search terms run against Indeed Israel.
+    # Two passes: one for intern/student roles, one for general SW roles.
+    "search_terms": {
+        TAB_STUDENT: "software engineer intern student Israel",
+        TAB_JUNIOR:  "junior software engineer Israel",
+    },
+    "location":      "Israel",
+    "country_indeed": "Israel",
+    "results_wanted": 50,    # per search term
+    "hours_old":      168,   # last 7 days
+    "sites":          ["indeed"],
+}
 
 
-def _is_detail_url(job_url: str, listing_url: str) -> bool:
+def _jobspy_row_to_job(row) -> dict:
     """
-    Return True if job_url looks like an individual job detail page
-    rather than an echo of the listing URL.
+    Convert a single JobSpy DataFrame row (pandas Series) into the dict
+    format expected by filter_jobs().
     """
-    if not job_url:
-        return False
-    # Same URL as the listing page -- AI just echoed it back
-    if job_url.rstrip("/") == listing_url.rstrip("/"):
-        return False
-    # Must be HTTP(S)
-    if not job_url.startswith("http"):
-        return False
-    # Sanity: same domain or a known ATS domain is fine; completely
-    # unrelated domains are likely hallucinations -- skip them.
-    listing_domain = urlparse(listing_url).netloc.lower()
-    job_domain     = urlparse(job_url).netloc.lower()
-    if job_domain != listing_domain:
-        # Allow known ATS redirects (e.g. listing on company site,
-        # detail on greenhouse.io / lever.co / comeet.com)
-        ats_domains = {
-            "greenhouse.io", "lever.co", "comeet.com", "myworkdayjobs.com",
-            "smartrecruiters.com", "jobvite.com", "icims.com", "taleo.net",
-            "oraclecloud.com", "successfactors.com", "eightfold.ai",
-        }
-        if not any(ats in job_domain for ats in ats_domains):
-            return False
-    return True
+    import pandas as pd
 
+    def safe(val, fallback="N/A"):
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return fallback
+        return str(val).strip() or fallback
 
-def _scrape_detail_page(url: str, log: logging.Logger) -> str:
-    """
-    Lightweight scrape of a single job detail page.
-    Tries requests first; falls back to Selenium for JS-rendered domains.
-    Returns visible text or empty string.
-    """
-    # Fast path: plain HTTP request
-    if not _is_js_rendered(url):
+    # Location: prefer city, fall back to country
+    city    = safe(getattr(row, "city",    None), "")
+    country = safe(getattr(row, "country", None), "")
+    if city and country:
+        location = f"{city}, {country}"
+    elif city:
+        location = city
+    elif country:
+        location = country
+    else:
+        location = "Israel"   # we searched Israel, so default is safe
+
+    # Date: JobSpy returns a date object or string
+    date_posted = safe(getattr(row, "date_posted", None))
+    if date_posted and date_posted != "N/A":
         try:
-            session = requests.Session()
-            session.headers.update(HEADERS)
-            resp = session.get(url, timeout=15)
-            resp.raise_for_status()
-            if resp.encoding and resp.encoding.lower() in ("latin-1", "iso-8859-1"):
-                resp.encoding = resp.apparent_encoding
-            if not is_cloudflare_page(resp.text):
-                soup = BeautifulSoup(resp.text, "html.parser")
-                text = extract_visible_text(soup)
-                if len(text) >= DETAIL_MIN_CONTENT:
-                    log.debug("[detail] requests OK -- %d chars", len(text))
-                    return text
-        except Exception as e:
-            log.debug("[detail] requests failed: %s", e)
-
-    # Selenium fallback for JS-rendered or failed requests
-    if SELENIUM_AVAILABLE:
-        try:
-            service = Service(ChromeDriverManager().install())
+            # Normalise to YYYY-MM-DD regardless of input format
+            import datetime as dt
+            if hasattr(date_posted, "strftime"):
+                date_posted = date_posted.strftime("%Y-%m-%d")
+            else:
+                parsed = dt.datetime.strptime(str(date_posted)[:10], "%Y-%m-%d")
+                date_posted = parsed.strftime("%Y-%m-%d")
         except Exception:
-            service = Service()
-        driver = None
+            pass
+
+    return {
+        "title":          safe(getattr(row, "title",       None)),
+        "company":        safe(getattr(row, "company",     None)),
+        "location":       location,
+        "description":    safe(getattr(row, "description", None)),
+        "qualifications": "N/A",   # Indeed doesn't separate qualifications
+        "date_posted":    date_posted,
+        "url":            safe(getattr(row, "job_url",     None)),
+    }
+
+
+def run_jobspy(log: logging.Logger) -> list:
+    """
+    Run JobSpy searches against Indeed Israel.
+    Returns a flat list of job dicts in filter_jobs() format.
+    """
+    if not JOBSPY_AVAILABLE:
+        log.warning("[jobspy] python-jobspy not installed -- skipping (pip install python-jobspy)")
+        return []
+
+    import warnings
+    all_jobs = []
+
+    for tab, term in JOBSPY_CONFIG["search_terms"].items():
+        log.info("[jobspy] Searching Indeed: %r ...", term)
         try:
-            driver = webdriver.Chrome(service=service, options=_build_chrome_options())
-            driver.set_page_load_timeout(25)
-            driver.get(url)
-            WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-            _smart_wait(driver, log)
-            soup = BeautifulSoup(driver.page_source, "html.parser")
-            text = extract_visible_text(soup)
-            log.debug("[detail] selenium OK -- %d chars", len(text))
-            return text if len(text) >= DETAIL_MIN_CONTENT else ""
-        except Exception as e:
-            log.debug("[detail] selenium failed: %s", e)
-        finally:
-            if driver:
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                df = jobspy_scrape(
+                    site_name       = JOBSPY_CONFIG["sites"],
+                    search_term     = term,
+                    location        = JOBSPY_CONFIG["location"],
+                    country_indeed  = JOBSPY_CONFIG["country_indeed"],
+                    results_wanted  = JOBSPY_CONFIG["results_wanted"],
+                    hours_old       = JOBSPY_CONFIG["hours_old"],
+                    description_format = "markdown",
+                )
 
-    return ""
-
-
-def _call_ollama_detail(content: str, company: str, title: str, log: logging.Logger) -> dict:
-    """Call Ollama on a detail page and return enrichment fields dict."""
-    prompt = DETAIL_PROMPT.format(
-        company=company,
-        title=title,
-        content=content[:6000],
-    )
-    base_url = OLLAMA_CONFIG["base_url"]
-    model    = OLLAMA_CONFIG["model"]
-
-    for use_json_fmt in (True, False):
-        payload = {
-            "model":   model,
-            "prompt":  prompt,
-            "stream":  False,
-            "options": {"temperature": 0.05, "top_p": 0.9, "num_predict": 1024},
-        }
-        if use_json_fmt:
-            payload["format"] = "json"
-        try:
-            resp = requests.post(
-                f"{base_url}/api/generate",
-                json=payload,
-                timeout=OLLAMA_CONFIG["timeout"],
-            )
-            if resp.status_code == 500 and use_json_fmt:
+            if df is None or df.empty:
+                log.info("[jobspy]   No results for %r", term)
                 continue
-            resp.raise_for_status()
-            raw = resp.json().get("response", "")
-            if not raw:
-                return {}
-            # Parse the flat dict response
-            raw = raw.strip()
-            raw = re.sub(r"^```(?:json)?\s*", "", raw)
-            raw = re.sub(r"\s*```$", "", raw)
-            raw = re.sub(r",\s*([}\]])", r"", raw)
-            start = raw.find("{")
-            end   = raw.rfind("}") + 1
-            if start == -1 or end <= start:
-                return {}
-            return json.loads(raw[start:end])
-        except Exception:
-            if not use_json_fmt:
-                return {}
-    return {}
 
+            log.info("[jobspy]   %d raw results for %r", len(df), term)
+            for _, row in df.iterrows():
+                all_jobs.append(_jobspy_row_to_job(row))
 
-def enrich_jobs_with_detail_pages(
-    jobs: list,
-    listing_url: str,
-    company: str,
-    log: logging.Logger,
-) -> list:
-    """
-    For each job extracted from a listing page, if it has a distinct detail
-    URL and is missing description/qualifications, fetch that page and ask
-    the AI to fill in the blanks.
+        except Exception as e:
+            log.error("[jobspy] Search failed for %r: %s", term, e)
 
-    Only follows detail URLs for jobs that pass the lightweight pre-filter
-    (SW role, not senior) to avoid wasting time on roles that will be
-    rejected anyway.
-
-    Mutates jobs in-place and returns the same list.
-    """
-    candidates = [
-        j for j in jobs
-        if is_software_role(str(j.get("title", "")))
-        and classify_role(str(j.get("title", ""))) is not None
-        and _is_detail_url(str(j.get("url", "")), listing_url)
-        and (
-            str(j.get("description",    "")).strip() in ("", "N/A")
-            or str(j.get("qualifications", "")).strip() in ("", "N/A")
-        )
-    ]
-
-    if not candidates:
-        return jobs
-
-    fetched = 0
-    for job in candidates:
-        if fetched >= DETAIL_FETCH_MAX:
-            log.debug("[detail] cap reached (%d), stopping detail fetches", DETAIL_FETCH_MAX)
-            break
-
-        detail_url = str(job.get("url", "")).strip()
-        title      = str(job.get("title", "")).strip()
-        log.info("[detail] fetching %s", detail_url)
-
-        text = _scrape_detail_page(detail_url, log)
-        fetched += 1
-
-        if not text:
-            log.debug("[detail] no content for: %s", detail_url)
-            continue
-
-        enrichment = _call_ollama_detail(text, company, title, log)
-        if not enrichment:
-            continue
-
-        # Only overwrite fields that were missing
-        for field in ("description", "qualifications", "location", "date_posted"):
-            existing = str(job.get(field, "")).strip()
-            new_val  = str(enrichment.get(field, "")).strip()
-            if existing in ("", "N/A") and new_val and new_val != "N/A":
-                job[field] = new_val
-                log.debug("[detail] enriched %s.%s = %s", title, field, new_val[:60])
-
-    return jobs
+    log.info("[jobspy] Total raw jobs from Indeed: %d", len(all_jobs))
+    return all_jobs
 
 
 # =============================================================================
@@ -1455,6 +1347,8 @@ def main():
     parser.add_argument("--model", default=None,
                         help="Ollama model override (default: qwen2.5:7b)")
     parser.add_argument("--debug", action="store_true", help="Verbose debug output")
+    parser.add_argument("--no-jobspy", action="store_true",
+                        help="Skip Indeed/JobSpy search (run company URLs only)")
     args = parser.parse_args()
 
     log = setup_logging(args.debug)
@@ -1502,11 +1396,35 @@ def main():
         log.error("[startup] No URLs to scrape. Add URLs to %s", args.urls)
         sys.exit(1)
 
-    # -- 5. Scrape loop --------------------------------------------------------
+    # -- 5. JobSpy / Indeed search ---------------------------------------------
     start_time = datetime.now()
     all_new = {TAB_STUDENT: [], TAB_JUNIOR: []}
     failed_urls = []
-    url_results = []   # [{url, status, jobs_found, jobs_saved}] for debug report
+    url_results = []
+
+    if not getattr(args, "no_jobspy", False):
+        jobspy_jobs = run_jobspy(log)
+        if jobspy_jobs:
+            for job in jobspy_jobs:
+                if not job.get("company"):
+                    job["company"] = "N/A"
+            jobspy_categorized = filter_jobs(jobspy_jobs, existing_ids, log)
+            n_student = len(jobspy_categorized[TAB_STUDENT])
+            n_junior  = len(jobspy_categorized[TAB_JUNIOR])
+            n_saved   = n_student + n_junior
+            log.info("[jobspy] Kept after filtering: %d student, %d junior", n_student, n_junior)
+            all_new[TAB_STUDENT].extend(jobspy_categorized[TAB_STUDENT])
+            all_new[TAB_JUNIOR].extend(jobspy_categorized[TAB_JUNIOR])
+            url_results.append({
+                "url":        "Indeed Israel (JobSpy)",
+                "status":     "SAVED" if n_saved > 0 else "FILTERED",
+                "jobs_found": len(jobspy_jobs),
+                "jobs_saved": n_saved,
+            })
+    else:
+        log.info("[jobspy] Skipped (--no-jobspy)")
+
+    # -- 6. Company URL scrape loop --------------------------------------------
 
     for i, url in enumerate(urls, 1):
         domain = urlparse(url).netloc
@@ -1532,9 +1450,6 @@ def main():
                     if not job.get("company"):
                         job["company"] = company
 
-                # Two-pass: follow individual job URLs to fill in missing fields
-                raw_jobs = enrich_jobs_with_detail_pages(raw_jobs, url, company, log)
-
                 categorized = filter_jobs(raw_jobs, existing_ids, log)
                 n_student = len(categorized[TAB_STUDENT])
                 n_junior  = len(categorized[TAB_JUNIOR])
@@ -1559,18 +1474,23 @@ def main():
         if i < len(urls):
             time.sleep(3)
 
-    # -- 6. Save to Sheets -----------------------------------------------------
+    # -- 8. Save to Sheets -----------------------------------------------------
     save_jobs_to_tab(ws_student, all_new[TAB_STUDENT], TAB_STUDENT, log)
     save_jobs_to_tab(ws_junior,  all_new[TAB_JUNIOR],  TAB_JUNIOR,  log)
 
-    # -- 7. Summary ------------------------------------------------------------
+    # -- 9. Summary ------------------------------------------------------------
     duration = datetime.now() - start_time
     total = len(all_new[TAB_STUDENT]) + len(all_new[TAB_JUNIOR])
+
+    jobspy_result = next((r for r in url_results if r["url"] == "Indeed Israel (JobSpy)"), None)
 
     print("\n" + "=" * 60)
     print("  COMPLETED")
     print("=" * 60)
     print(f"  Duration:       {str(duration).split('.')[0]}")
+    if jobspy_result:
+        print(f"  Indeed (JobSpy): {jobspy_result['jobs_saved']} saved "
+              f"({jobspy_result['jobs_found']} raw)")
     print(f"  URLs scraped:   {len(urls) - len(failed_urls)}/{len(urls)}")
     print(f"  New jobs saved: {total} ({len(all_new[TAB_STUDENT])} student, {len(all_new[TAB_JUNIOR])} junior)")
     if failed_urls:
@@ -1580,7 +1500,7 @@ def main():
     print(f"  Sheet: {sheet_url}")
     print("=" * 60)
 
-    # -- 8. Write clean debug report -------------------------------------------
+    # -- 10. Write clean debug report -------------------------------------------
     debug_dir  = Path("debug")
     debug_dir.mkdir(exist_ok=True)
     debug_file = debug_dir / f"debug_{start_time.strftime('%Y%m%d_%H%M')}.txt"
