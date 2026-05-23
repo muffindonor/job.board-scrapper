@@ -645,7 +645,7 @@ def _is_shell_page(text: str) -> bool:
 
 
 def scrape_with_requests(url: str, log: logging.Logger):
-    """Fast path. Returns (text, soup) or (None, None)."""
+    """Fast path. Returns (text, soup, hint) or (None, None, hint)."""
     session = requests.Session()
     session.headers.update(HEADERS)
     for attempt in range(2):
@@ -656,11 +656,11 @@ def scrape_with_requests(url: str, log: logging.Logger):
                 resp.encoding = resp.apparent_encoding
             if is_cloudflare_page(resp.text):
                 log.warning("[requests] Cloudflare detected -- escalating")
-                return None, None
+                return None, None, None
             soup = BeautifulSoup(resp.text, "html.parser")
             text = extract_visible_text(soup)
             log.debug("[requests] OK -- %d chars", len(text))
-            return text, soup
+            return text, soup, None
         except requests.exceptions.HTTPError as e:
             code = e.response.status_code if e.response is not None else 0
             if code in (404, 410):
@@ -732,7 +732,7 @@ def scrape_with_uc(url: str, log: logging.Logger):
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--window-size=1920,1080")
-        driver = uc.Chrome(options=opts, headless=True, version_main=146)
+        driver = uc.Chrome(options=opts, headless=True, version_main=148)
         driver.set_page_load_timeout(40)
         driver.get(url)
         time.sleep(6)
