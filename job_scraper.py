@@ -18,13 +18,13 @@ import time
 import html
 import re
 import hashlib
+import socket
 import logging
 import traceback
 import argparse
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
-import socket
 
 import requests
 import gspread
@@ -133,6 +133,9 @@ def write_debug_report(
     sep  = "=" * 70
     sep2 = "-" * 70
 
+    total_jobs_saved = sum(r.get("jobs_saved", 0) for r in url_results)
+    total_jobs_found = sum(r.get("jobs_found", 0) for r in url_results)
+
     lines += [
         sep,
         f"  JOB SCRAPER DEBUG REPORT",
@@ -143,7 +146,10 @@ def write_debug_report(
         "",
         "  URL SUMMARY",
         sep2,
-        f"  {'SAVED':<10} {len(saved):>3}  -- jobs written to sheet",
+        f"  {'JOBS SAVED':<12} {total_jobs_saved:>3}  -- total new jobs written to sheet",
+        f"  {'JOBS FOUND':<12} {total_jobs_found:>3}  -- total raw jobs extracted before filtering",
+        sep2,
+        f"  {'SAVED':<10} {len(saved):>3}  -- URL sources that produced jobs",
         f"  {'FILTERED':<10} {len(filtered):>3}  -- scraped OK, all jobs rejected (senior/non-IL/duplicate)",
         f"  {'NO_JOBS':<10} {len(no_jobs):>3}  -- scraped OK, AI found nothing",
         f"  {'FAILED':<10} {len(failed):>3}  -- could not scrape (blocked/broken URL)",
@@ -250,9 +256,9 @@ JS_RENDERED_DOMAINS = [
     "jobvite.com",          # Jobvite
     "successfactors.com",   # SAP SuccessFactors
     "eightfold.ai",         # Eightfold AI (AmEx, etc.)
-    "comeet.com",              # Comeet (common in Israeli companies)
-    "career.rafael.co.il",     # Rafael career site (JS-rendered)
-    "jobs.careers.microsoft.com",  # Microsoft careers (SSL cert mismatch)
+    "comeet.com",           # Comeet (common in Israeli companies)
+    "career.rafael.co.il",  # Rafael career site (JS-rendered)
+    "jobs.careers.microsoft.com",  # Microsoft careers SPA (JS-rendered)
 ]
 
 # Sheet tab names
@@ -509,6 +515,7 @@ def _build_chrome_options() -> Options:
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
+    opts.add_argument("--ignore-certificate-errors")
     opts.add_argument("--window-size=1920,1080")
     opts.add_argument(f"--user-agent={HEADERS['User-Agent']}")
     opts.add_argument("--disable-logging")
@@ -516,7 +523,6 @@ def _build_chrome_options() -> Options:
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-background-networking")
     opts.add_argument("--disable-features=TranslateUI")
-    opts.add_argument("--ignore-certificate-errors")
     opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_experimental_option("prefs", {
@@ -657,15 +663,18 @@ def scrape_with_requests(url: str, log: logging.Logger):
             return text, soup
         except requests.exceptions.HTTPError as e:
             code = e.response.status_code if e.response is not None else 0
-            if code in (403, 404, 410, 429):
-                log.warning("[requests] Dead/blocked (%d) -- not escalating", code)
-                return None, None
+            if code in (404, 410):
+                log.warning("[requests] Dead URL (%d) -- skipping all tiers", code)
+                return None, None, "dead"
+            if code in (403, 429):
+                log.warning("[requests] Bot-blocked (%d) -- skipping Selenium, jumping to UC", code)
+                return None, None, "bot"
             log.warning("[requests] HTTP error attempt %d: %s", attempt + 1, e)
         except requests.exceptions.RequestException as e:
             log.warning("[requests] Error attempt %d: %s", attempt + 1, e)
             if attempt == 0:
                 time.sleep(1)
-    return None, None
+    return None, None, None
 
 
 def scrape_with_selenium(url: str, log: logging.Logger):
@@ -751,19 +760,6 @@ def scrape_with_uc(url: str, log: logging.Logger):
                 pass
 
 
-
-def _dns_check(url: str, log: logging.Logger) -> bool:
-    """Return True if the hostname resolves, False if DNS lookup fails."""
-    try:
-        hostname = urlparse(url).hostname
-        if not hostname:
-            return False
-        socket.getaddrinfo(hostname, None)
-        return True
-    except socket.gaierror:
-        log.warning("[scrape] DNS resolution failed for %s -- skipping", hostname)
-        return False
-
 def scrape_page(url: str, log: logging.Logger):
     """
     Try requests -> Selenium -> undetected-chromedriver.
@@ -774,15 +770,20 @@ def scrape_page(url: str, log: logging.Logger):
         log.warning("[scrape] Skipping blocked domain: %s", domain)
         return None, None
 
-    # Pre-flight DNS check -- avoids burning ~13s on dead hostnames
-    if not _dns_check(url, log):
-        return None, None
-
     # Attempt 1 (skipped for known JS-rendered platforms)
     if _is_js_rendered(url):
         log.info("[scrape] Known JS-rendered platform -- skipping requests")
     else:
-        text, soup = scrape_with_requests(url, log)
+        text, soup, fail_type = scrape_with_requests(url, log)
+        if fail_type == "dead":
+            log.warning("[scrape] Hard 404/410 -- aborting all tiers")
+            return None, None
+        if fail_type == "bot":
+            log.info("[scrape] Bot-block detected -- jumping directly to UC")
+            text, soup = scrape_with_uc(url, log)
+            if text and len(text) >= MIN_CONTENT:
+                return text, soup
+            return None, None
         if text and len(text) >= MIN_CONTENT:
             if _is_shell_page(text):
                 log.info("[scrape] Shell page detected (no job vocabulary) -- escalating to Selenium")
@@ -880,7 +881,16 @@ def call_ollama(content: str, company: str, url: str, log: logging.Logger):
             if not raw:
                 log.error("[ai] Empty response from Ollama")
                 return []
-            return _parse_ai_response(raw, log)
+            result = _parse_ai_response(raw, log)
+            if result is None:
+                # JSON was truncated -- retry with double token budget
+                if payload["options"]["num_predict"] < 4096:
+                    log.warning("[ai] JSON truncated -- retrying with num_predict=4096")
+                    payload["options"]["num_predict"] = 4096
+                    continue  # re-run the for loop iteration with new payload
+                log.error("[ai] JSON parse failed even at 4096 tokens -- skipping")
+                return []
+            return result
 
         except requests.exceptions.ConnectionError:
             log.error("[ai] Cannot reach Ollama at %s -- is it running?", base_url)
@@ -919,7 +929,7 @@ def _parse_ai_response(raw: str, log: logging.Logger) -> list:
         return jobs
     except json.JSONDecodeError as e:
         log.warning("[ai] JSON parse error: %s", e)
-        return []
+        return None  # None = truncated/malformed; [] = valid empty list
 
 
 # =============================================================================
@@ -945,7 +955,7 @@ JOBSPY_CONFIG = {
 
     # Sites to query. ZipRecruiter excluded -- US-only inventory.
     # linkedin_fetch_description fetches full descriptions (slower but worth it).
-    "sites":          ["indeed", "linkedin", "glassdoor", "google", "bayt"],
+    "sites":          ["indeed", "linkedin"],  # glassdoor=API auth required, bayt=403 on IL IP, google=no IL results
 }
 
 
@@ -1094,7 +1104,7 @@ def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger) -> dict:
             continue
 
         if not is_israeli_location(location):
-            log.debug("[filter] Skipping non-IL location: %s | %s", title, location)
+            log.info("[filter] SKIP non-IL:     %s | %s", title, location)
             continue
 
         date_posted = str(job.get("date_posted", "")).strip()
@@ -1311,14 +1321,14 @@ def save_jobs_to_tab(ws, jobs: list, tab_name: str, log: logging.Logger):
     rows = [[job.get(k, "") for k in key_order] for job in jobs]
 
     # --- Step 1: write all data rows in batches with rate-limit retry ---
-    # Snapshot row count BEFORE any writes so formatting offsets are exact
-    first_new_row = len(ws.get_all_values()) + 1
-
+    first_new_row = None   # track where new rows started (1-based)
     BATCH = 10
     for i in range(0, len(rows), BATCH):
         batch = rows[i:i + BATCH]
         for attempt in range(3):
             try:
+                if first_new_row is None:
+                    first_new_row = len(ws.get_all_values()) + 1  # capture BEFORE append
                 ws.append_rows(batch, value_input_option="RAW")
                 break
             except gspread.exceptions.APIError as e:
@@ -1337,7 +1347,7 @@ def save_jobs_to_tab(ws, jobs: list, tab_name: str, log: logging.Logger):
         if i + BATCH < len(rows):
             time.sleep(2)  # gentle pacing between batches
 
-    # --- Step 3: format ALL new rows in a SINGLE batch_update call ---
+    # --- Step 2: format ALL new rows in a SINGLE batch_update call ---
     if first_new_row is not None:
         all_format_reqs = []
         for offset in range(len(rows)):
@@ -1477,7 +1487,20 @@ def main():
 
     # -- 6. Company URL scrape loop --------------------------------------------
 
+    def _dns_ok(url: str) -> bool:
+        """Quick DNS pre-check to skip URLs whose host doesn't resolve."""
+        try:
+            host = urlparse(url).netloc.split(":")[0]
+            socket.getaddrinfo(host, None)
+            return True
+        except socket.gaierror:
+            return False
+
     for i, url in enumerate(urls, 1):
+        if not _dns_ok(url):
+            log.warning("[dns] Cannot resolve host -- skipping: %s", urlparse(url).netloc)
+            url_results.append({"url": url, "status": "FAILED", "jobs_found": 0, "jobs_saved": 0})
+            continue
         domain = urlparse(url).netloc
         log.info("[%d/%d] %s", i, len(urls), domain)
 

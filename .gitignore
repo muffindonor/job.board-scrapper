@@ -3,6 +3,6 @@
 !company_urls.txt
 /logs
 *.html
-*.md
 !README.md
-
+*.md
+*.bat
