@@ -22,6 +22,9 @@ import socket
 import logging
 import traceback
 import argparse
+import subprocess
+import signal
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -585,18 +588,17 @@ def _smart_wait(driver, log: logging.Logger) -> int:
     while elapsed < JS_SMART_WAIT_MAX:
         time.sleep(JS_SMART_WAIT_POLL)
         elapsed += JS_SMART_WAIT_POLL
-        try:
-            # Signal 1: known job element check (one JS round-trip)
-            job_text = driver.execute_script(_JOB_SELECTORS_JS)
-            if job_text and len(job_text) > 200:
-                log.debug("[smart-wait] Job element detected after %.0fs (%d chars)", elapsed, len(job_text))
-                return len(job_text)
+        # Signal 1: known job element check (one JS round-trip)
+        # driver.execute_script returns None if the script errors inside the browser
+        # so we check the return value rather than catching an exception.
+        job_text = driver.execute_script(_JOB_SELECTORS_JS)
+        if job_text and len(job_text) > 200:
+            log.debug("[smart-wait] Job element detected after %.0fs (%d chars)", elapsed, len(job_text))
+            return len(job_text)
 
-            # Signal 2: body text volume + stability
-            body = driver.execute_script("return document.body ? document.body.innerText : '';")
-            cur = len(body or "")
-        except Exception:
-            cur = 0
+        # Signal 2: body text volume + stability
+        body = driver.execute_script("return document.body ? document.body.innerText : '';")
+        cur = len(body or "")
 
         log.debug("[smart-wait] %.0fs | %d chars | stable %d/%d", elapsed, cur, stable, JS_STABLE_ROUNDS)
         if cur >= MIN_CONTENT:
@@ -611,14 +613,19 @@ def _smart_wait(driver, log: logging.Logger) -> int:
     return last_len
 
 
-def _scroll_page(driver):
-    """Scroll to trigger lazy-loaded content."""
-    try:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(1)
-        driver.execute_script("window.scrollTo(0, 0);")
-    except Exception:
-        pass
+def _scroll_page(driver) -> bool:
+    """
+    Scroll to trigger lazy-loaded content.
+    Returns True if scroll succeeded, False if the driver is no longer usable.
+    Does not raise -- uses return value so callers can decide what to do.
+    """
+    result = driver.execute_script("return document.body ? true : false;")
+    if not result:
+        return False
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(1)
+    driver.execute_script("window.scrollTo(0, 0);")
+    return True
 
 
 def _is_js_rendered(url: str) -> bool:
@@ -677,28 +684,167 @@ def scrape_with_requests(url: str, log: logging.Logger):
     return None, None, None
 
 
-def scrape_with_selenium(url: str, log: logging.Logger):
-    """Selenium fallback. Returns (text, soup) or (None, None)."""
+# ---------------------------------------------------------------------------
+# Driver context managers -- guarantee Chrome process cleanup no matter what
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def _selenium_driver(log: logging.Logger):
+    """
+    Context manager that creates a Selenium Chrome driver and guarantees
+    cleanup at the OS process level, not just at the driver.quit() level.
+
+    The key insight: driver.quit() sends a graceful shutdown signal but can
+    fail silently on Windows, especially if the page load is still in progress.
+    We track the ChromeDriver PID before yielding, and after the with-block
+    exits (for any reason -- normal return, exception, timeout, anything),
+    we verify the process is actually gone and force-kill it if not.
+
+    Usage:
+        with _selenium_driver(log) as driver:
+            if driver is None:
+                return None, None   # selenium not available or failed to start
+            driver.get(url)
+            ...
+    """
     if not SELENIUM_AVAILABLE:
         log.warning("[selenium] Not installed")
-        return None, None
+        yield None
+        return
 
     driver = None
+    driver_pid = None
     try:
-        try:
-            service = Service(ChromeDriverManager().install())
-        except Exception:
-            service = Service()
-        driver = webdriver.Chrome(service=service, options=_build_chrome_options())
+        service = Service(ChromeDriverManager().install())
+    except Exception:
+        service = Service()
+
+    driver = webdriver.Chrome(service=service, options=_build_chrome_options())
+    # Record the chromedriver PID immediately after launch so we can kill
+    # it by PID if quit() fails later.
+    driver_pid = driver.service.process.pid if driver.service.process else None
+
+    try:
+        yield driver
+    finally:
+        # Step 1: attempt graceful quit
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass  # expected to sometimes fail -- that's why we have step 2
+
+        # Step 2: verify the chromedriver process is actually dead.
+        # If it's still alive, kill it and all its children (Chrome renderers etc.)
+        if driver_pid is not None:
+            _force_kill_pid(driver_pid, log, label="selenium")
+
+
+@contextmanager
+def _uc_driver(log: logging.Logger):
+    """
+    Context manager for undetected-chromedriver. Same guarantee as
+    _selenium_driver -- OS-level process cleanup after every use.
+
+    UC is more prone to leaving zombie processes than regular Selenium because
+    its stealth patching interferes with Chrome's normal shutdown sequence.
+    The force-kill step here is especially important.
+    """
+    if not UC_AVAILABLE:
+        log.warning("[uc] undetected-chromedriver not installed")
+        yield None
+        return
+
+    driver = None
+    driver_pid = None
+
+    opts = uc.ChromeOptions()
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1920,1080")
+
+    driver = uc.Chrome(options=opts, headless=True, version_main=148)
+    driver_pid = driver.service.process.pid if driver.service.process else None
+
+    try:
+        yield driver
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+        if driver_pid is not None:
+            _force_kill_pid(driver_pid, log, label="uc")
+
+
+def _force_kill_pid(pid: int, log: logging.Logger, label: str = "") -> None:
+    """
+    Kill a process and all its children by PID using taskkill on Windows.
+    This is the nuclear option -- it guarantees no orphan Chrome processes
+    regardless of what state the driver is in.
+
+    We use taskkill /T (terminate tree) which kills the process AND every
+    child process it spawned (Chrome renderers, GPU processes, etc.).
+
+    On non-Windows systems falls back to os.kill with SIGTERM then SIGKILL.
+    """
+    prefix = f"[{label}] " if label else ""
+    try:
+        if sys.platform == "win32":
+            # /F = force, /T = include child processes, /PID = target by PID
+            result = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                log.debug("%sForce-killed driver process tree (PID %d)", prefix, pid)
+            else:
+                # returncode 128 means the process was already gone -- that's fine
+                if b"not found" not in result.stderr.lower() and result.returncode != 128:
+                    log.warning("%staskkill returned %d for PID %d", prefix, result.returncode, pid)
+        else:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.5)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # already dead, which is what we wanted
+    except (ProcessLookupError, PermissionError):
+        pass  # process already gone -- this is the happy path
+    except Exception as e:
+        log.warning("%sUnexpected error killing PID %d: %s", prefix, pid, e)
+
+
+def scrape_with_selenium(url: str, log: logging.Logger):
+    """
+    Selenium fallback. Returns (text, soup) or (None, None).
+    Uses _selenium_driver context manager to guarantee Chrome cleanup.
+    Control flow is explicit -- no exceptions used for routing.
+    """
+    with _selenium_driver(log) as driver:
+        if driver is None:
+            return None, None
+
         driver.set_page_load_timeout(30)
         driver.get(url)
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+
+        # Wait for body rather than catching TimeoutException
+        body_present = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+        if not body_present:
+            log.warning("[selenium] Body never appeared")
+            return None, None
+
         _scroll_page(driver)
         _smart_wait(driver, log)
 
         page_html = driver.page_source
-        if is_cloudflare_page(page_html):
-            log.warning("[selenium] Cloudflare detected -- escalating")
+        if not page_html or is_cloudflare_page(page_html):
+            log.warning("[selenium] Cloudflare detected or empty page -- escalating")
             return None, None
 
         soup = BeautifulSoup(page_html, "html.parser")
@@ -706,33 +852,18 @@ def scrape_with_selenium(url: str, log: logging.Logger):
         log.debug("[selenium] OK -- %d chars", len(text))
         return text, soup
 
-    except TimeoutException:
-        log.warning("[selenium] Timed out")
-    except WebDriverException as e:
-        log.warning("[selenium] Error: %s", e)
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
-    return None, None
-
 
 def scrape_with_uc(url: str, log: logging.Logger):
-    """undetected-chromedriver last resort. Returns (text, soup) or (None, None)."""
-    if not UC_AVAILABLE:
-        log.warning("[uc] undetected-chromedriver not installed")
-        return None, None
-
+    """
+    undetected-chromedriver last resort. Returns (text, soup) or (None, None).
+    Uses _uc_driver context manager to guarantee Chrome cleanup.
+    """
     log.info("[uc] Attempting bypass scrape...")
-    driver = None
-    try:
-        opts = uc.ChromeOptions()
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1920,1080")
-        driver = uc.Chrome(options=opts, headless=True, version_main=148)
+
+    with _uc_driver(log) as driver:
+        if driver is None:
+            return None, None
+
         driver.set_page_load_timeout(40)
         driver.get(url)
         time.sleep(6)
@@ -740,7 +871,7 @@ def scrape_with_uc(url: str, log: logging.Logger):
         _smart_wait(driver, log)
 
         page_html = driver.page_source
-        if is_cloudflare_page(page_html):
+        if not page_html or is_cloudflare_page(page_html):
             log.warning("[uc] Still blocked by Cloudflare")
             return None, None
 
@@ -748,16 +879,6 @@ def scrape_with_uc(url: str, log: logging.Logger):
         text = extract_visible_text(soup)
         log.debug("[uc] OK -- %d chars", len(text))
         return text, soup
-
-    except Exception as e:
-        log.warning("[uc] Error: %s", e)
-        return None, None
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
 
 
 def scrape_page(url: str, log: logging.Logger):
@@ -1399,6 +1520,35 @@ def load_urls(urls_file: str, log: logging.Logger) -> list:
 # Main
 # =============================================================================
 
+def kill_orphan_chromes(log: logging.Logger) -> None:
+    """
+    Kill any Chrome or ChromeDriver processes left over from previous runs
+    before we start a new one. This is a safety net for the case where the
+    script was interrupted mid-run (Ctrl+C, crash, Task Scheduler kill, etc.)
+    and the context managers didn't get a chance to clean up.
+
+    Only kills processes owned by the current user to avoid touching
+    other users' Chrome sessions on a shared machine.
+    """
+    if sys.platform != "win32":
+        return  # taskkill is Windows-only; on Linux pkill would be used instead
+
+    targets = ("chrome.exe", "chromedriver.exe")
+    killed = 0
+    for name in targets:
+        result = subprocess.run(
+            ["taskkill", "/F", "/IM", name, "/T"],
+            capture_output=True,
+            timeout=10,
+        )
+        # returncode 128 = "process not found" -- that's fine, nothing to kill
+        if result.returncode == 0:
+            killed += 1
+    if killed:
+        log.info("[startup] Cleaned up orphan Chrome processes from previous run")
+        time.sleep(1)  # brief pause to let OS fully release ports/handles
+
+
 def main():
     parser = argparse.ArgumentParser(description="Automated job listings scraper -> Google Sheets")
     parser.add_argument("--sheet", default="job-scrapper",
@@ -1413,6 +1563,9 @@ def main():
     args = parser.parse_args()
 
     log = setup_logging(args.debug)
+
+    # Kill any orphan Chrome/ChromeDriver processes from a previous interrupted run
+    kill_orphan_chromes(log)
 
     if args.model:
         OLLAMA_CONFIG["model"] = args.model
