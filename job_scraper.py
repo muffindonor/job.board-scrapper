@@ -526,12 +526,9 @@ def _build_chrome_options() -> Options:
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-background-networking")
     opts.add_argument("--disable-features=TranslateUI")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_experimental_option("prefs", {
-        "profile.managed_default_content_settings.images": 2,
-        "profile.default_content_setting_values.notifications": 2,
-    })
+    # Removed: excludeSwitches and useAutomationExtension --
+    # useAutomationExtension was removed in Chrome ~111 and passing it
+    # causes Chrome 148 to exit immediately during session creation.
     return opts
 
 
