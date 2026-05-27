@@ -526,9 +526,6 @@ def _build_chrome_options() -> Options:
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-background-networking")
     opts.add_argument("--disable-features=TranslateUI")
-    # Removed: excludeSwitches and useAutomationExtension --
-    # useAutomationExtension was removed in Chrome ~111 and passing it
-    # causes Chrome 148 to exit immediately during session creation.
     return opts
 
 
@@ -754,6 +751,7 @@ def _uc_driver(log: logging.Logger):
 
     driver = None
     driver_pid = None
+    browser_pid = None
 
     opts = uc.ChromeOptions()
     opts.add_argument("--no-sandbox")
@@ -762,6 +760,7 @@ def _uc_driver(log: logging.Logger):
 
     driver = uc.Chrome(options=opts, headless=True, version_main=148)
     driver_pid = driver.service.process.pid if driver.service.process else None
+    browser_pid = getattr(driver, "browser_pid", None)
 
     try:
         yield driver
@@ -772,8 +771,12 @@ def _uc_driver(log: logging.Logger):
             except Exception:
                 pass
 
+        # Kill chromedriver and its direct children
         if driver_pid is not None:
-            _force_kill_pid(driver_pid, log, label="uc")
+            _force_kill_pid(driver_pid, log, label="uc-chromedriver")
+        # Kill chrome browser process tree separately (UC re-launch may orphan this)
+        if browser_pid is not None and browser_pid != driver_pid:
+            _force_kill_pid(browser_pid, log, label="uc-browser")
 
 
 def _force_kill_pid(pid: int, log: logging.Logger, label: str = "") -> None:
