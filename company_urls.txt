@@ -21,6 +21,7 @@ https://www.arineta.com/israel/
 https://www.americanexpress.com/en-us/careers/student-programs/global-students-page.html?intlink=us-amex-career-en-us-home-student-global
 https://snyk.io/careers/all-jobs/?location=Israel
 https://unity.com/careers/positions?location=tel-aviv&department=engineering
+https://verbit.ai/careers/
 https://careers.weaviate.io/jobs/4569335-internship
 https://www.salesforce.com/company/careers/jobs/?search=&country=Israel&jobtype=Intern&pagesize=20#results
 https://acsmotioncontrol.com/careers-israel/
@@ -45,7 +46,6 @@ https://careers.appsflyer.com/#careersOps
 https://vastdata.com/careers/
 https://drivenets.com/careers/#open-pos
 https://www.ai21.com/careers
-https://verbit.ai/careers-listing/?location-career=Tel-Aviv&search-career
 https://www.etoro.com/about/careers/
 https://careers.mobileye.com/jobs
 https://cadence.wd1.myworkdayjobs.com/en-US/External_Careers?Location_Country=084562884af243748dad7c84c304d89a
@@ -62,7 +62,6 @@ https://smartbear.com/company/careers/
 https://jobs.akamai.com/en/sites/CX_1/jobs?lastSelectedFacet=LOCATIONS&location=Israel&locationId=300000000469279&locationLevel=country&mode=location&selectedLocationsFacet=300000000469279&selectedTitlesFacet=ENG%3BOPS
 https://careers.holcimgroup.com/go/All-Jobs/8790902/
 https://elbitsystemscareer.com/go/%D7%94%D7%A0%D7%93%D7%A1%D7%94-%D7%95%D7%A4%D7%99%D7%AA%D7%95%D7%97/9358855/
-https://elbitsystemscareer.com/go/%D7%A1%D7%98%D7%95%D7%93%D7%A0%D7%98%D7%99%D7%9D/9275855/
 https://wd3.myworkdaysite.com/recruiting/yokogawa/yokogawa-career-site?jobFamilyGroup=90c114695bc91000beccba5202270000
 https://jobs.lever.co/foxitsoftware
 https://qm.teamme.link/
@@ -75,7 +74,6 @@ https://lightrun.com/careers/
 https://www.zafran.io/careers#positions
 https://www.ivix.ai/company/careers
 https://www.edwards.com/careers/jobsearch?location=Israel-Caesarea%20Granit%2CIsrael-Caesarea-Hybrid
-https://www.spiralsolutions.com/careers/co/tel-aviv/all/
 https://www.sentinelone.com/jobs/?search=prompt
 https://wfi-water.com/about/careers/
 https://www.ox.security/careers/#job-openings

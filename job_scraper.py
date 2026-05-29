@@ -42,7 +42,6 @@ try:
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.common.exceptions import TimeoutException, WebDriverException
-    from webdriver_manager.chrome import ChromeDriverManager
     SELENIUM_AVAILABLE = True
 except ImportError:
     SELENIUM_AVAILABLE = False
@@ -81,10 +80,7 @@ def setup_logging(debug: bool = False) -> logging.Logger:
         ],
     )
     for noisy in [
-        "urllib3", "selenium", "webdriver_manager",
-        "webdriver_manager.core", "webdriver_manager.core.driver_cache",
-        "webdriver_manager.core.manager", "webdriver_manager.core.download_manager",
-        "webdriver_manager.drivers", "requests", "gspread", "undetected_chromedriver",
+        "urllib3", "selenium", "requests", "gspread", "undetected_chromedriver",
     ]:
         logging.getLogger(noisy).setLevel(logging.ERROR)
 
@@ -214,6 +210,13 @@ def write_debug_report(
 # Constants / defaults
 # =============================================================================
 
+# Pinned Chrome for Testing binaries -- see chrome/README.md for setup.
+# These are committed alongside the script so the version is fully controlled
+# and immune to silent Chrome auto-updates breaking the scraper overnight.
+_CHROME_DIR      = Path(__file__).parent / "chrome"
+CHROME_EXE       = str(_CHROME_DIR / "chrome-win64"      / "chrome.exe")
+CHROMEDRIVER_EXE = str(_CHROME_DIR / "chromedriver-win64" / "chromedriver.exe")
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -304,13 +307,23 @@ SW_KEYWORDS = {
 
 # Israeli city names for location filtering
 ISRAELI_CITIES = {
-    "jerusalem", "tel aviv", "haifa", "petah tikva", "rishon lezion",
+    "jerusalem", "tel aviv", "tel-aviv", "haifa", "petah tikva", "rishon lezion",
     "netanya", "ashdod", "bnei brak", "beersheba", "beer sheva", "holon",
     "ramat gan", "beit shemesh", "ashkelon", "rehovot", "bat yam", "herzliya",
     "hadera", "kfar saba", "modiin", "modi'in", "lod", "raanana", "givatayim",
     "hod hasharon", "or yehuda", "kiryat", "nazareth", "nahariya", "acre",
     "akko", "tiberias", "eilat", "caesarea", "rosh haayin", "nes ziona",
     "yokneam", "karmiel", "safed", "tzfat", "givat shmuel", "ra'anana",
+}
+
+# Domains that are Israel-only job boards or career pages.
+# Jobs from these sources skip the location check -- the AI often returns N/A
+# for location when it isn't displayed inline on the listing page, but for
+# these domains we know every posting is Israeli by definition.
+ISRAEL_ONLY_DOMAINS = {
+    "goozali.com",
+    "devjobs.co.il",
+    "nortech-platform.com",
 }
 
 # Keywords that classify a role as student/intern
@@ -468,11 +481,19 @@ def is_software_role(title: str) -> bool:
     return any(kw in t for kw in SW_KEYWORDS)
 
 
-def is_israeli_location(location: str) -> bool:
+def is_israeli_location(location: str, source_domain: str = "") -> bool:
+    # If the source is a known Israel-only domain, skip the location field
+    # entirely -- the AI often returns N/A when location isn't shown inline.
+    if source_domain and source_domain in ISRAEL_ONLY_DOMAINS:
+        return True
     if not location or not location.strip():
         return False
     loc = location.lower()
     if "israel" in loc or "\u05d9\u05e9\u05e8\u05d0\u05dc" in location:
+        return True
+    # ", il" / " il" at the end is the ISO-3166-1 alpha-2 code LinkedIn etc. use
+    # e.g. "Tel-Aviv, IL" -- safe as a suffix check, won't match "Brazil" etc.
+    if loc.endswith(", il") or loc.endswith(" il"):
         return True
     return any(city in loc for city in ISRAELI_CITIES)
 
@@ -514,6 +535,7 @@ def is_current_year(date_str: str) -> bool:
 
 def _build_chrome_options() -> Options:
     opts = Options()
+    opts.binary_location = CHROME_EXE
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -526,6 +548,13 @@ def _build_chrome_options() -> Options:
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-background-networking")
     opts.add_argument("--disable-features=TranslateUI")
+    # Note: excludeSwitches/useAutomationExtension are intentionally omitted --
+    # useAutomationExtension was removed in Chrome ~111 and passing it causes
+    # Chrome 112+ to exit immediately during session creation.
+    opts.add_experimental_option("prefs", {
+        "profile.managed_default_content_settings.images": 2,
+        "profile.default_content_setting_values.notifications": 2,
+    })
     return opts
 
 
@@ -708,12 +737,8 @@ def _selenium_driver(log: logging.Logger):
 
     driver = None
     driver_pid = None
-    try:
-        service = Service(ChromeDriverManager().install())
-    except Exception:
-        service = Service()
 
-    driver = webdriver.Chrome(service=service, options=_build_chrome_options())
+    driver = webdriver.Chrome(service=Service(CHROMEDRIVER_EXE), options=_build_chrome_options())
     # Record the chromedriver PID immediately after launch so we can kill
     # it by PID if quit() fails later.
     driver_pid = driver.service.process.pid if driver.service.process else None
@@ -751,16 +776,19 @@ def _uc_driver(log: logging.Logger):
 
     driver = None
     driver_pid = None
-    browser_pid = None
 
     opts = uc.ChromeOptions()
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
 
-    driver = uc.Chrome(options=opts, headless=True, version_main=148)
+    driver = uc.Chrome(
+        options=opts,
+        headless=True,
+        driver_executable_path=CHROMEDRIVER_EXE,
+        browser_executable_path=CHROME_EXE,
+    )
     driver_pid = driver.service.process.pid if driver.service.process else None
-    browser_pid = getattr(driver, "browser_pid", None)
 
     try:
         yield driver
@@ -771,12 +799,8 @@ def _uc_driver(log: logging.Logger):
             except Exception:
                 pass
 
-        # Kill chromedriver and its direct children
         if driver_pid is not None:
-            _force_kill_pid(driver_pid, log, label="uc-chromedriver")
-        # Kill chrome browser process tree separately (UC re-launch may orphan this)
-        if browser_pid is not None and browser_pid != driver_pid:
-            _force_kill_pid(browser_pid, log, label="uc-browser")
+            _force_kill_pid(driver_pid, log, label="uc")
 
 
 def _force_kill_pid(pid: int, log: logging.Logger, label: str = "") -> None:
@@ -1200,11 +1224,12 @@ def run_jobspy(log: logging.Logger) -> list:
 # Filtering & deduplication
 # =============================================================================
 
-def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger) -> dict:
+def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger, source_url: str = "") -> dict:
     """
     Filter raw AI output. Returns {"Student_Jobs": [...], "Junior_Jobs": [...]}.
     """
     results = {TAB_STUDENT: [], TAB_JUNIOR: []}
+    source_domain = urlparse(source_url).netloc.removeprefix("www.") if source_url else ""
 
     for job in jobs:
         title    = str(job.get("title", "")).strip()
@@ -1224,7 +1249,7 @@ def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger) -> dict:
             log.info("[filter] SKIP senior/lead: %s", title)
             continue
 
-        if not is_israeli_location(location):
+        if not is_israeli_location(location, source_domain):
             log.info("[filter] SKIP non-IL:     %s | %s", title, location)
             continue
 
@@ -1677,7 +1702,7 @@ def main():
                     if not job.get("company"):
                         job["company"] = company
 
-                categorized = filter_jobs(raw_jobs, existing_ids, log)
+                categorized = filter_jobs(raw_jobs, existing_ids, log, source_url=url)
                 n_student = len(categorized[TAB_STUDENT])
                 n_junior  = len(categorized[TAB_JUNIOR])
                 n_saved   = n_student + n_junior

@@ -6,3 +6,6 @@ __pycache__/
 debug/
 logs/
 run_job_scraper.bat
+chrome/chrome-win64/
+chrome/chromedriver-win64/
+
