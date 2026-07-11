@@ -8,4 +8,6 @@ logs/
 run_job_scraper.bat
 chrome/chrome-win64/
 chrome/chromedriver-win64/
+company_urls.txt
+
 

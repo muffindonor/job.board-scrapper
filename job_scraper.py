@@ -758,6 +758,14 @@ def _selenium_driver(log: logging.Logger):
         if driver_pid is not None:
             _force_kill_pid(driver_pid, log, label="selenium")
 
+        # Step 3: blanket sweep. chromedriver exiting does not guarantee Chrome's
+        # own process tree is gone -- the crashpad-handler subprocess is designed
+        # to detach and outlive the browser it monitors, so it (and sometimes the
+        # GPU/renderer processes) can survive even a clean driver.quit(). Since
+        # driver_pid only ever tracked chromedriver, not chrome.exe itself, this
+        # is the only thing that actually catches those survivors.
+        kill_orphan_chromes(log)
+
 
 @contextmanager
 def _uc_driver(log: logging.Logger):
@@ -801,6 +809,9 @@ def _uc_driver(log: logging.Logger):
 
         if driver_pid is not None:
             _force_kill_pid(driver_pid, log, label="uc")
+
+        # Blanket sweep -- see comment in _selenium_driver's finally block.
+        kill_orphan_chromes(log)
 
 
 def _force_kill_pid(pid: int, log: logging.Logger, label: str = "") -> None:
