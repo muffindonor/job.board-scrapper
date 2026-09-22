@@ -767,6 +767,26 @@ def _selenium_driver(log: logging.Logger):
         kill_orphan_chromes(log)
 
 
+def _get_chrome_major_version(log: logging.Logger) -> int | None:
+    """
+    Read the pinned Chrome binary's major version without executing it.
+    undetected-chromedriver's own auto-detection doesn't recognise a
+    portable binary outside the normal install path and silently falls
+    back to a stale hardcoded default ("assuming chrome 108 or higher"),
+    which breaks the entire UC tier for any site that reaches it.
+    """
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"(Get-Item '{CHROME_EXE}').VersionInfo.FileVersion"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return int(result.stdout.strip().split(".")[0])
+    except Exception as e:
+        log.debug("[uc] Could not read Chrome version: %s", e)
+        return None
+
+
 @contextmanager
 def _uc_driver(log: logging.Logger):
     """
@@ -795,6 +815,7 @@ def _uc_driver(log: logging.Logger):
         headless=True,
         driver_executable_path=CHROMEDRIVER_EXE,
         browser_executable_path=CHROME_EXE,
+        version_main=_get_chrome_major_version(log),
     )
     driver_pid = driver.service.process.pid if driver.service.process else None
 
@@ -1468,7 +1489,8 @@ def load_existing_ids(worksheets: dict, log: logging.Logger) -> set:
 
 
 def save_jobs_to_tab(ws, jobs: list, tab_name: str, log: logging.Logger):
-    """Append new jobs to a tab in batches, then format all new rows in ONE batch_update call."""
+    """Insert new jobs at the top of a tab (row 2, right after the header) in batches,
+    so the sheet always reads newest-to-oldest, then format all new rows in ONE batch_update call."""
     if not jobs:
         return
 
@@ -1477,16 +1499,15 @@ def save_jobs_to_tab(ws, jobs: list, tab_name: str, log: logging.Logger):
                  "description", "qualifications", "location", "url"]
     rows = [[job.get(k, "") for k in key_order] for job in jobs]
 
-    # --- Step 1: write all data rows in batches with rate-limit retry ---
-    first_new_row = None   # track where new rows started (1-based)
+    # --- Step 1: insert all data rows at row 2, in batches, with rate-limit retry ---
+    # Batches are inserted in REVERSE order so the final on-sheet order (top to bottom)
+    # still matches `rows`' original order, sitting as one block above the existing rows.
     BATCH = 10
-    for i in range(0, len(rows), BATCH):
-        batch = rows[i:i + BATCH]
+    batches = [rows[i:i + BATCH] for i in range(0, len(rows), BATCH)]
+    for idx, batch in enumerate(reversed(batches)):
         for attempt in range(3):
             try:
-                if first_new_row is None:
-                    first_new_row = len(ws.get_all_values()) + 1  # capture BEFORE append
-                ws.append_rows(batch, value_input_option="RAW")
+                ws.insert_rows(batch, row=2, value_input_option="RAW")
                 break
             except gspread.exceptions.APIError as e:
                 if "429" in str(e):
@@ -1501,14 +1522,14 @@ def save_jobs_to_tab(ws, jobs: list, tab_name: str, log: logging.Logger):
                 if attempt < 2:
                     time.sleep(5)
 
-        if i + BATCH < len(rows):
+        if idx + 1 < len(batches):
             time.sleep(2)  # gentle pacing between batches
 
-    # --- Step 2: format ALL new rows in a SINGLE batch_update call ---
-    if first_new_row is not None:
+    # --- Step 2: format ALL new rows (row 2 .. 2+len(rows)-1) in a SINGLE batch_update call ---
+    if rows:
         all_format_reqs = []
         for offset in range(len(rows)):
-            all_format_reqs.extend(_build_row_format_requests(ws, first_new_row + offset))
+            all_format_reqs.extend(_build_row_format_requests(ws, 2 + offset))
         try:
             # Split into chunks of 100 requests to stay within API limits
             CHUNK = 100
