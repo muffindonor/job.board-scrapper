@@ -25,7 +25,7 @@ import argparse
 import subprocess
 import signal
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -517,6 +517,35 @@ def classify_role(title: str) -> str | None:
     # Unclassified: no junior OR senior signal. Keep in Junior_Jobs as a
     # potential entry-level role (e.g. plain "Software Engineer").
     return TAB_JUNIOR
+
+
+def normalize_date_posted(raw: str, reference: datetime) -> str:
+    """
+    Convert date_posted to YYYY-MM-DD. The AI is asked to already return this
+    format, but some ATS pages (Workday in particular) only show relative
+    text like "Posted Today" / "Posted 3 Days Ago", which the AI sometimes
+    echoes back verbatim instead of resolving. `reference` is the date the
+    page was scraped -- what that relative text is actually relative to.
+    Falls back to "N/A" when there's no exact day count to anchor to
+    (e.g. "30+ Days Ago"), rather than writing a misleadingly precise date.
+    """
+    raw = (raw or "").strip()
+    if not raw or raw == "N/A":
+        return "N/A"
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", raw):
+        return raw
+
+    low = raw.lower()
+    if "today" in low:
+        return reference.strftime("%Y-%m-%d")
+    if "yesterday" in low:
+        return (reference - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    m = re.search(r"(\d+)\s*\+?\s*days?\s+ago", low)
+    if m and "+" not in low:
+        return (reference - timedelta(days=int(m.group(1)))).strftime("%Y-%m-%d")
+
+    return "N/A"
 
 
 def is_current_year(date_str: str) -> bool:
@@ -1262,6 +1291,7 @@ def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger, source_url: 
     """
     results = {TAB_STUDENT: [], TAB_JUNIOR: []}
     source_domain = urlparse(source_url).netloc.removeprefix("www.") if source_url else ""
+    scrape_time = datetime.now()
 
     for job in jobs:
         title    = str(job.get("title", "")).strip()
@@ -1285,7 +1315,7 @@ def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger, source_url: 
             log.info("[filter] SKIP non-IL:     %s | %s", title, location)
             continue
 
-        date_posted = str(job.get("date_posted", "")).strip()
+        date_posted = normalize_date_posted(str(job.get("date_posted", "")).strip(), scrape_time)
         if not is_current_year(date_posted):
             log.debug("[filter] Skipping old posting: %s | %s", title, date_posted)
             continue
@@ -1310,7 +1340,7 @@ def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger, source_url: 
 
         results[tab].append({
             "date_posted":    date_posted or "N/A",
-            "date_added":     datetime.now().strftime("%Y-%m-%d"),
+            "date_added":     scrape_time.strftime("%Y-%m-%d"),
             "company":        company or "N/A",
             "title":          title,
             "description":    description,
