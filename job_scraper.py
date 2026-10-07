@@ -24,6 +24,7 @@ import traceback
 import argparse
 import subprocess
 import signal
+from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -303,6 +304,9 @@ SW_KEYWORDS = {
     "data engineer", "ml engineer", "machine learning", "ai engineer",
     "embedded software", "firmware", "game developer", "security engineer",
     "student", "intern", "internship", "trainee",  # include student roles explicitly
+    "embedded",
+    # Hebrew -- matched as substrings, so attached prefixes (ל/ה/ו) still match
+    "תוכנה", "פיתוח", "מפתח", "מהנדס", "אוטומציה", "בדיקות", "סטודנט",
 }
 
 # Israeli city names for location filtering
@@ -341,6 +345,11 @@ SENIOR_KEYWORDS = re.compile(
     r"\b(senior|sr\b|principal|staff|lead|director|manager|head of|architect|vp|chief|distinguished|fellow)\b",
     re.IGNORECASE
 )
+
+# Hebrew equivalents. No \b: Hebrew prefixes attach to the word ("לסטודנט").
+STUDENT_KEYWORDS_HE = re.compile(r"סטודנט|מתמחה|התמחות")
+SENIOR_KEYWORDS_HE  = re.compile(r"בכיר|ראש צוות|מנהל|ארכיטקט")
+JUNIOR_KEYWORDS_HE  = re.compile(r"ג'וניור|ג׳וניור|זוטר|ללא ניסיון")
 
 # ATS platforms where the hiring company name lives in the URL path, not the domain.
 # e.g. comeet.com/jobs/blockaid/... -> company = "Blockaid"
@@ -486,8 +495,11 @@ def is_israeli_location(location: str, source_domain: str = "") -> bool:
     # entirely -- the AI often returns N/A when location isn't shown inline.
     if source_domain and source_domain in ISRAEL_ONLY_DOMAINS:
         return True
-    if not location or not location.strip():
-        return False
+    if not location or location.strip() in ("", "N/A"):
+        # source_domain is only set for company_urls.txt pages, which are curated
+        # Israeli/Israel-filtered pages -- there a missing location means "not shown
+        # on the listing", not "abroad". JobSpy results keep the strict check.
+        return bool(source_domain)
     loc = location.lower()
     if "israel" in loc or "\u05d9\u05e9\u05e8\u05d0\u05dc" in location:
         return True
@@ -508,11 +520,11 @@ def classify_role(title: str) -> str | None:
       - Junior keywords   → TAB_JUNIOR
       - No keywords match → TAB_JUNIOR only if no senior signals; otherwise reject
     """
-    if STUDENT_KEYWORDS.search(title):
+    if STUDENT_KEYWORDS.search(title) or STUDENT_KEYWORDS_HE.search(title):
         return TAB_STUDENT
-    if SENIOR_KEYWORDS.search(title):
+    if SENIOR_KEYWORDS.search(title) or SENIOR_KEYWORDS_HE.search(title):
         return None   # senior/principal/lead/director -- skip
-    if JUNIOR_KEYWORDS.search(title):
+    if JUNIOR_KEYWORDS.search(title) or JUNIOR_KEYWORDS_HE.search(title):
         return TAB_JUNIOR
     # Unclassified: no junior OR senior signal. Keep in Junior_Jobs as a
     # potential entry-level role (e.g. plain "Software Engineer").
@@ -1049,12 +1061,17 @@ Rules:
 """
 
 
+CONTENT_LIMIT = 8000
+
+
 def call_ollama(content: str, company: str, url: str, log: logging.Logger):
     """Send scraped content to Ollama and return list of job dicts."""
+    if len(content) > CONTENT_LIMIT:
+        log.info("[ai] Page content cut from %d to %d chars", len(content), CONTENT_LIMIT)
     prompt = EXTRACTION_PROMPT.format(
         company=company,
         url=url,
-        content=content[:8000],
+        content=content[:CONTENT_LIMIT],
     )
 
     base_url = OLLAMA_CONFIG["base_url"]
@@ -1063,12 +1080,18 @@ def call_ollama(content: str, company: str, url: str, log: logging.Logger):
 
     log.info("[ai] Analyzing with %s...", model)
 
-    for use_json_fmt in (True, False):
+    # State lives outside the loop so a retry actually changes the next request.
+    use_json_fmt = True
+    num_predict  = 2048
+    for _attempt in range(4):
         payload = {
             "model": model,
             "prompt": prompt,
             "stream": False,
-            "options": {"temperature": 0.05, "top_p": 0.9, "num_predict": 2048},
+            # num_ctx must fit the ~8k-char prompt plus a 4096-token answer;
+            # the server default (OLLAMA_CONTEXT_LENGTH=8192) is too tight for that.
+            "options": {"temperature": 0.05, "top_p": 0.9,
+                        "num_predict": num_predict, "num_ctx": 12288},
         }
         if use_json_fmt:
             payload["format"] = "json"
@@ -1081,6 +1104,7 @@ def call_ollama(content: str, company: str, url: str, log: logging.Logger):
             )
             if resp.status_code == 500 and use_json_fmt:
                 log.debug("[ai] format=json not supported, retrying without...")
+                use_json_fmt = False
                 continue
             resp.raise_for_status()
             raw = resp.json().get("response", "")
@@ -1089,11 +1113,10 @@ def call_ollama(content: str, company: str, url: str, log: logging.Logger):
                 return []
             result = _parse_ai_response(raw, log)
             if result is None:
-                # JSON was truncated -- retry with double token budget
-                if payload["options"]["num_predict"] < 4096:
+                if num_predict < 4096:
                     log.warning("[ai] JSON truncated -- retrying with num_predict=4096")
-                    payload["options"]["num_predict"] = 4096
-                    continue  # re-run the for loop iteration with new payload
+                    num_predict = 4096
+                    continue
                 log.error("[ai] JSON parse failed even at 4096 tokens -- skipping")
                 return []
             return result
@@ -1108,6 +1131,7 @@ def call_ollama(content: str, company: str, url: str, log: logging.Logger):
             log.error("[ai] HTTP error: %s | %s", e, resp.text[:200])
             if not use_json_fmt:
                 return []
+            use_json_fmt = False
         except requests.exceptions.RequestException as e:
             log.error("[ai] Request failed: %s", e)
             return []
@@ -1292,6 +1316,7 @@ def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger, source_url: 
     results = {TAB_STUDENT: [], TAB_JUNIOR: []}
     source_domain = urlparse(source_url).netloc.removeprefix("www.") if source_url else ""
     scrape_time = datetime.now()
+    skipped = Counter()
 
     for job in jobs:
         title    = str(job.get("title", "")).strip()
@@ -1303,26 +1328,31 @@ def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger, source_url: 
 
         if not is_software_role(title):
             log.info("[filter] SKIP non-SW:     %s", title)
+            skipped["non-SW"] += 1
             continue
 
         # Classify first -- rejects senior/principal/lead/director roles
         tab = classify_role(title)
         if tab is None:
             log.info("[filter] SKIP senior/lead: %s", title)
+            skipped["senior"] += 1
             continue
 
         if not is_israeli_location(location, source_domain):
             log.info("[filter] SKIP non-IL:     %s | %s", title, location)
+            skipped["non-IL"] += 1
             continue
 
         date_posted = normalize_date_posted(str(job.get("date_posted", "")).strip(), scrape_time)
         if not is_current_year(date_posted):
             log.debug("[filter] Skipping old posting: %s | %s", title, date_posted)
+            skipped["old"] += 1
             continue
 
         job_id = create_job_id(title, company, location)
         if job_id in existing_ids:
             log.debug("[filter] Duplicate: %s @ %s", title, company)
+            skipped["dup"] += 1
             continue
 
         description    = clean_field(str(job.get("description",    "N/A")), "description")
@@ -1334,6 +1364,7 @@ def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger, source_url: 
             # Still save if we at least have a direct job URL (title + URL is useful)
             job_url = str(job.get("url", "")).strip()
             if not job_url or job_url == str(job.get("source_url", "")):
+                skipped["hollow"] += 1
                 continue
 
         existing_ids.add(job_id)
@@ -1349,6 +1380,10 @@ def filter_jobs(jobs: list, existing_ids: set, log: logging.Logger, source_url: 
             "url":            str(job.get("url", "")).strip(),
         })
 
+    if jobs:
+        kept = len(results[TAB_STUDENT]) + len(results[TAB_JUNIOR])
+        log.info("[filter] kept %d | %s", kept,
+                 " | ".join(f"{k} {skipped[k]}" for k in ("dup", "senior", "non-IL", "non-SW", "old", "hollow")))
     return results
 
 
