@@ -1484,6 +1484,31 @@ def _build_row_format_requests(ws, row_number: int) -> list:
     ]
 
 
+def _build_url_hyperlink_request(ws, row_number: int, url: str) -> dict | None:
+    """
+    Return an updateCells request that turns a URL cell into a clickable
+    =HYPERLINK() formula. Set via updateCells (not values.append/insert_rows),
+    so it's unaffected by the RAW value_input_option used for the rest of the
+    row -- plain text there is what keeps date strings and scraped description
+    text from being misread as formulas.
+    """
+    if not url or url == "N/A":
+        return None
+    url_col_idx = SHEET_COLUMNS.index("URL")
+    escaped = url.replace('"', '""')
+    return {
+        "updateCells": {
+            "range": {
+                "sheetId": ws.id,
+                "startRowIndex": row_number - 1, "endRowIndex": row_number,
+                "startColumnIndex": url_col_idx, "endColumnIndex": url_col_idx + 1,
+            },
+            "rows": [{"values": [{"userEnteredValue": {"formulaValue": f'=HYPERLINK("{escaped}")'}}]}],
+            "fields": "userEnteredValue",
+        }
+    }
+
+
 def _format_data_row(ws, row_number: int, log: logging.Logger):
     """Format a single data row (kept for backward-compat; prefer batching)."""
     try:
@@ -1559,7 +1584,11 @@ def save_jobs_to_tab(ws, jobs: list, tab_name: str, log: logging.Logger):
     if rows:
         all_format_reqs = []
         for offset in range(len(rows)):
-            all_format_reqs.extend(_build_row_format_requests(ws, 2 + offset))
+            row_number = 2 + offset
+            all_format_reqs.extend(_build_row_format_requests(ws, row_number))
+            hyperlink_req = _build_url_hyperlink_request(ws, row_number, jobs[offset].get("url", ""))
+            if hyperlink_req:
+                all_format_reqs.append(hyperlink_req)
         try:
             # Split into chunks of 100 requests to stay within API limits
             CHUNK = 100
