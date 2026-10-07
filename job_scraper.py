@@ -1061,17 +1061,55 @@ Rules:
 """
 
 
-CONTENT_LIMIT = 8000
+# Long pages are sent in overlapping chunks rather than one big prompt: a 7B
+# model extracts poorly from very long input, and each chunk keeps the prompt
+# at the size num_ctx=12288 was sized for.
+CHUNK_SIZE    = 8000
+CHUNK_OVERLAP = 400    # so a listing straddling a boundary appears whole in one chunk
+MAX_CHUNKS    = 4      # 32k chars per page; caps run time on huge pages
+
+
+def _split_content(content: str) -> list:
+    chunks = []
+    start = 0
+    while start < len(content) and len(chunks) < MAX_CHUNKS:
+        end = min(start + CHUNK_SIZE, len(content))
+        if end < len(content):
+            cut = content.rfind(" ", start + CHUNK_SIZE // 2, end)
+            if cut != -1:
+                end = cut
+        chunks.append(content[start:end])
+        if end >= len(content):
+            break
+        start = end - CHUNK_OVERLAP
+    return chunks
 
 
 def call_ollama(content: str, company: str, url: str, log: logging.Logger):
-    """Send scraped content to Ollama and return list of job dicts."""
-    if len(content) > CONTENT_LIMIT:
-        log.info("[ai] Page content cut from %d to %d chars", len(content), CONTENT_LIMIT)
+    """Send scraped content to Ollama (chunked if long) and return merged job dicts."""
+    chunks = _split_content(content)
+    covered = sum(len(c) for c in chunks) - CHUNK_OVERLAP * (len(chunks) - 1)
+    if len(chunks) > 1:
+        log.info("[ai] Page is %d chars -- analyzing in %d chunks", len(content), len(chunks))
+    if covered < len(content):
+        log.info("[ai] Page content cut from %d to %d chars", len(content), covered)
+
+    jobs, seen = [], set()
+    for chunk in chunks:
+        for job in _call_ollama_once(chunk, company, url, log):
+            key = (str(job.get("title", "")).strip().lower(), str(job.get("url", "")).strip())
+            if key not in seen:
+                seen.add(key)
+                jobs.append(job)
+    return jobs
+
+
+def _call_ollama_once(content: str, company: str, url: str, log: logging.Logger):
+    """Send one chunk of page content to Ollama and return its list of job dicts."""
     prompt = EXTRACTION_PROMPT.format(
         company=company,
         url=url,
-        content=content[:CONTENT_LIMIT],
+        content=content,
     )
 
     base_url = OLLAMA_CONFIG["base_url"]
