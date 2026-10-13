@@ -38,7 +38,7 @@ $Trigger.Enabled              = $true
 $TriggerXml = $TaskDef.XmlText
 
 $Settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 8) `
     -RestartCount 1 `
     -RestartInterval (New-TimeSpan -Minutes 10) `
     -StartWhenAvailable `

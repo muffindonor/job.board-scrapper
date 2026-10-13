@@ -1831,6 +1831,47 @@ def kill_orphan_chromes(log: logging.Logger) -> None:
         time.sleep(1)  # brief pause to let OS fully release ports/handles
 
 
+GAME_CHECK_INTERVAL = 60  # seconds between checks while paused
+
+
+def _fullscreen_app_running() -> bool:
+    """True while a fullscreen game/app is in front (the same signal Windows' own
+    "don't disturb while gaming" uses). Needs the task to run in the user's session."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        state = ctypes.c_int()
+        if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state)) != 0:
+            return False
+        return state.value in (2, 3)  # QUNS_BUSY (fullscreen app), QUNS_RUNNING_D3D_FULL_SCREEN
+    except Exception:
+        return False
+
+
+def _unload_ollama_model(log: logging.Logger) -> None:
+    """Free the model's GPU memory now instead of after Ollama's idle timeout."""
+    try:
+        requests.post(f"{OLLAMA_CONFIG['base_url']}/api/generate",
+                      json={"model": OLLAMA_CONFIG["model"], "keep_alive": 0}, timeout=30)
+    except requests.exceptions.RequestException as e:
+        log.debug("[pause] Could not unload model: %s", e)
+
+
+def wait_while_gaming(log: logging.Logger, before_pause=None) -> None:
+    """Block while a fullscreen game is running, with the GPU freed."""
+    if not _fullscreen_app_running():
+        return
+    log.info("[pause] Fullscreen game/app detected -- pausing until it closes")
+    if before_pause:
+        before_pause()
+    _unload_ollama_model(log)
+    paused_at = time.time()
+    while _fullscreen_app_running():
+        time.sleep(GAME_CHECK_INTERVAL)
+    log.info("[pause] Resuming after %d min", (time.time() - paused_at) // 60)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Automated job listings scraper -> Google Sheets")
     parser.add_argument("--sheet", default="job-scrapper",
@@ -1953,7 +1994,17 @@ def main():
         except socket.gaierror:
             return False
 
+    # Jobs are written as they accumulate whenever the run pauses, so a run that is
+    # stopped while paused (Task Scheduler's time limit, or closed by hand) keeps them.
+    saved_upto = {TAB_STUDENT: 0, TAB_JUNIOR: 0}
+
+    def save_pending():
+        for tab, ws in ((TAB_STUDENT, ws_student), (TAB_JUNIOR, ws_junior)):
+            save_jobs_to_tab(ws, all_new[tab][saved_upto[tab]:], tab, log)
+            saved_upto[tab] = len(all_new[tab])
+
     for i, url in enumerate(urls, 1):
+        wait_while_gaming(log, before_pause=save_pending)
         if not _dns_ok(url):
             log.warning("[dns] Cannot resolve host -- skipping: %s", urlparse(url).netloc)
             url_results.append({"url": url, "status": "FAILED", "jobs_found": 0, "jobs_saved": 0})
@@ -2006,8 +2057,7 @@ def main():
             time.sleep(3)
 
     # -- 8. Save to Sheets -----------------------------------------------------
-    save_jobs_to_tab(ws_student, all_new[TAB_STUDENT], TAB_STUDENT, log)
-    save_jobs_to_tab(ws_junior,  all_new[TAB_JUNIOR],  TAB_JUNIOR,  log)
+    save_pending()
 
     # -- 9. Summary ------------------------------------------------------------
     duration = datetime.now() - start_time
