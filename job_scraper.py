@@ -418,7 +418,10 @@ def extract_visible_text(soup: BeautifulSoup) -> str:
 def create_job_id(title: str, company: str, location: str) -> str:
     """MD5-based dedup key."""
     raw = f"{title}_{company}_{location}".lower().strip()
-    raw = re.sub(r"[^a-z0-9_]", "", raw)
+    # \w keeps Hebrew letters; [a-z0-9] used to erase them, so every Hebrew-titled
+    # job at the same company+location collapsed into one ID. IDs are recomputed
+    # from the sheet each run, so changing this doesn't orphan existing rows.
+    raw = re.sub(r"[^\w]", "", raw)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
@@ -1344,6 +1347,96 @@ def run_jobspy(log: logging.Logger) -> list:
 
 
 # =============================================================================
+# Elbit Systems direct feed
+# =============================================================================
+# Elbit's careers site renders every job from one public JSON file, and its job
+# cards aren't real links. Reading the file directly gives every job with its
+# full text and a direct per-job URL -- no page scraping or AI extraction.
+
+ELBIT_FEED_URL   = "https://elbitsystemscareer.com/cron/jobs.json"
+ELBIT_JOB_URL    = "https://elbitsystemscareer.com/job/?jid={}"
+ELBIT_AREAS      = {"North", "Haifa", "Center", "Sharon"}
+ELBIT_CATEGORIES = {1, 6}   # the site's "expertise" filter: 1 = engineering, 6 = students
+
+# Pages covered by a direct feed are skipped in the company-URL scrape loop.
+DIRECT_FEED_DOMAINS = {"elbitsystemscareer.com"}
+
+# The site maps city codes to names with a table baked into its JS bundle;
+# copied here (Oct 2026). Codes not listed fall back to the job's area.
+ELBIT_CITIES = {
+    72: "ערד", 85: "אשדוד", 91: "נצרת עלית", 104: "קריית שמונה", 106: "פארק הייטק בר לב",
+    109: "איירפורט סיטי", 134: "באר שבע", 416: "חיפה", 443: "חצרים", 467: "חולון",
+    524: "כרמיאל", 628: "לוד", 770: "מודיעין", 816: "נתניה", 964: "רמת גן",
+    966: "רמת השרון", 975: "רמלה", 992: "רחובות", 1008: "ראש העין", 1050: "שדרות",
+    1137: "תל אביב", 1203: "יבנה", 1227: "יקנעם",
+}
+
+# Heading on its own line ("Requirements", ":Requirements", "דרישות המשרה:"), or inline "Requirements: ..."
+_REQUIREMENTS_HEADING_RE = re.compile(
+    r"^[ :]*(requirements?|(?:required )?qualifications|what we[’']re looking for|what you[’']ll bring"
+    r"|דרישות(?: המשרה| התפקיד)?)[ :]*$"
+    r"|(?:requirements|qualifications|דרישות(?: המשרה| התפקיד)?)\s*:",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _html_to_text(s: str) -> str:
+    s = html.unescape(s or "")
+    s = re.sub(r"<br\s*/?>|</(div|p|li)>", "\n", s, flags=re.IGNORECASE)
+    s = html.unescape(re.sub(r"<[^>]+>", " ", s))
+    s = re.sub(r"[ \t\xa0]+", " ", s)
+    return re.sub(r"\s*\n\s*", "\n", s).strip()
+
+
+def _elbit_categories(job: dict) -> set:
+    v = job.get("categoryIds") or []
+    if isinstance(v, str):
+        v = re.findall(r"\d+", v)
+    return {int(x) for x in v}
+
+
+def _elbit_location(job: dict) -> str:
+    for p in job.get("extendedProperties") or []:
+        if p.get("PropertyName") == "Cities":
+            for code in re.findall(r"\d+", str(p.get("Value"))):
+                if int(code) in ELBIT_CITIES:
+                    return f"{ELBIT_CITIES[int(code)]}, Israel"
+    return f"{job.get('area') or 'N/A'}, Israel"
+
+
+def elbit_feed_job_to_row(job: dict) -> dict:
+    """Convert one Elbit feed entry to the job-dict format filter_jobs() expects."""
+    text = re.sub(r"^We are looking for\s*\n", "", _html_to_text(job.get("description")), flags=re.IGNORECASE)
+    m = _REQUIREMENTS_HEADING_RE.search(text)
+    description = text[:m.start()] if m else text
+    requirements = _html_to_text(job.get("requirements")) or (text[m.end():].strip() if m else "")
+    return {
+        "title":          str(job.get("jobTitle") or "").strip(),
+        "company":        "Elbit Systems",
+        "location":       _elbit_location(job),
+        "description":    description.strip()[:1000] or "N/A",
+        "qualifications": requirements[:1000] or "N/A",
+        "date_posted":    str(job.get("openDate") or "")[:10] or "N/A",
+        "url":            ELBIT_JOB_URL.format(job["jobId"]),
+    }
+
+
+def fetch_elbit_jobs(log: logging.Logger) -> list:
+    """Return Elbit jobs in the target areas/categories, in filter_jobs() format."""
+    try:
+        resp = requests.get(ELBIT_FEED_URL, headers=HEADERS, timeout=60)
+        resp.raise_for_status()
+        feed = resp.json()
+    except Exception as e:
+        log.error("[elbit] Could not load job feed: %s", e)
+        return []
+    jobs = [elbit_feed_job_to_row(j) for j in feed
+            if j.get("area") in ELBIT_AREAS and _elbit_categories(j) & ELBIT_CATEGORIES]
+    log.info("[elbit] %d of %d feed jobs in target areas/categories", len(jobs), len(feed))
+    return jobs
+
+
+# =============================================================================
 # Filtering & deduplication
 # =============================================================================
 
@@ -1826,6 +1919,28 @@ def main():
             })
     else:
         log.info("[jobspy] Skipped (--no-jobspy)")
+
+    # -- 5b. Elbit Systems direct feed -----------------------------------------
+
+    elbit_jobs = fetch_elbit_jobs(log)
+    if elbit_jobs:
+        elbit_categorized = filter_jobs(elbit_jobs, existing_ids, log, source_url=ELBIT_FEED_URL)
+        n_saved = len(elbit_categorized[TAB_STUDENT]) + len(elbit_categorized[TAB_JUNIOR])
+        log.info("[elbit] Kept after filtering: %d student, %d junior",
+                 len(elbit_categorized[TAB_STUDENT]), len(elbit_categorized[TAB_JUNIOR]))
+        all_new[TAB_STUDENT].extend(elbit_categorized[TAB_STUDENT])
+        all_new[TAB_JUNIOR].extend(elbit_categorized[TAB_JUNIOR])
+        url_results.append({
+            "url":        "Elbit Systems job feed",
+            "status":     "SAVED" if n_saved > 0 else "FILTERED",
+            "jobs_found": len(elbit_jobs),
+            "jobs_saved": n_saved,
+        })
+
+    feed_covered = [u for u in urls if urlparse(u).netloc.lower().removeprefix("www.") in DIRECT_FEED_DOMAINS]
+    if feed_covered:
+        log.info("[urls] Skipping %d URL(s) covered by a direct feed: %s", len(feed_covered), ", ".join(feed_covered))
+        urls = [u for u in urls if u not in feed_covered]
 
     # -- 6. Company URL scrape loop --------------------------------------------
 
